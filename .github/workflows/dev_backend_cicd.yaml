@@ -1,0 +1,221 @@
+name: Build and Push to ECR
+
+on:
+    push:
+        branches:
+            - develop
+    pull_request:
+        branches:
+            - develop
+        types:
+          - closed
+    workflow_dispatch:  
+
+jobs:
+    deploy:
+        name: Build and Push Docker Image to Amazon ECR
+        runs-on: ubuntu-latest
+    
+        steps:
+            # Step 1: Checkout code
+            - name: Checkout repository
+              uses: actions/checkout@v3
+
+            # Step 2: Install Docker Compose
+            - name: Install Docker Compose
+              run: |
+                sudo curl -L "https://github.com/docker/compose/releases/download/v2.22.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+                sudo chmod +x /usr/local/bin/docker-compose
+                docker-compose --version
+            # install json parser
+            - name: install json parser
+              run:
+                sudo apt-get install jq
+            # Step 3: Log in to AWS ECR
+            - name: Log in to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v2
+              env:
+                AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                AWS_REGION: ${{ secrets.AWS_REGION }}
+
+            # Step 4: Create .env File Dynamically
+            - name: Create .env File
+              run: |
+                echo '${{ secrets.DEPLOYEMENT_CONFIG }}' > deploy_config.json
+
+                cat <<EOF > .env
+                POSTGRES_USER=$(jq -r '.POSTGRES_USER' deploy_config.json)
+                POSTGRES_PASSWORD=$(jq -r '.POSTGRES_PASSWORD' deploy_config.json)
+                POSTGRES_DB=$(jq -r '.POSTGRES_DB' deploy_config.json)
+                POSTGRES_HOST=$(jq -r '.POSTGRES_HOST' deploy_config.json)
+                POSTGRES_PORT=$(jq -r '.POSTGRES_PORT' deploy_config.json)
+                DATABASE_URI_ASYNC=$(jq -r '.DATABASE_URI_ASYNC' deploy_config.json)
+                JWT_SECRET=${{ secrets.JWT_SECRET }}
+                ALGORITHM=${{ secrets.ALGORITHM }}
+                OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+                PINECONE_API_KEY=$(jq -r '.PINECONE_API_KEY' deploy_config.json)
+                PINECONE_ENV=$(jq -r '.PINECONE_ENV' deploy_config.json)
+                PINECONE_KNOWLEDGE_BASE_INDEX=$(jq -r '.PINECONE_KNOWLEDGE_BASE_INDEX' deploy_config.json)
+                REDIS_HOST=$(jq -r '.REDIS_HOST' deploy_config.json)
+                REDIS_PORT=$(jq -r '.REDIS_PORT' deploy_config.json)
+                AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+                AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}
+                AWS_REGION=${{ secrets.AWS_REGION }}
+                TIME_TO_LIVE_IN_SECONDS=${{ secrets.TIME_TO_LIVE_IN_SECONDS }}
+                PUBLIC_TIME_TO_LIVE_IN_SECONDS=${{ secrets.PUBLIC_TIME_TO_LIVE_IN_SECONDS }}
+                MAX_SESSIONS=${{ secrets.MAX_SESSIONS }}
+                APP_NAME=${{ secrets.APP_NAME }}
+                FRONTEND_HOST=$(jq -r '.FRONTEND_HOST' deploy_config.json)
+                MAIL_USERNAME=${{ secrets.MAIL_USERNAME }}
+                MAIL_PASSWORD=${{ secrets.MAIL_PASSWORD }}
+                MAIL_PORT=${{ secrets.MAIL_PORT }}
+                MAIL_SERVER=${{ secrets.MAIL_SERVER }}
+                MAIL_STARTTLS=${{ secrets.MAIL_STARTTLS }}
+                MAIL_SSL_TLS=${{ secrets.MAIL_SSL_TLS }}
+                MAIL_DEBUG=${{ secrets.MAIL_DEBUG }}
+                MAIL_FROM=$(jq -r '.MAIL_FROM' deploy_config.json)
+                MAIL_FROM_NAME=${{ secrets.MAIL_FROM_NAME }}
+                MAIL_USE_CREDENTIALS=${{ secrets.MAIL_USE_CREDENTIALS }}
+                VERIFICATION_TOKEN_SECRET=${{ secrets.VERIFICATION_TOKEN_SECRET }}
+                BUCKET_NAME=$(jq -r '.BUCKET_NAME' deploy_config.json)
+                ACCESS_TOKEN_EXPIRE_MINUTES=${{ secrets.ACCESS_TOKEN_EXPIRE_MINUTES }}
+                REFRESH_TOKEN_EXPIRE_DAYS=${{ secrets.REFRESH_TOKEN_EXPIRE_DAYS }}
+                DEBUG=${{ secrets.DEBUG }}
+                EMBEDDINGS_MODEL=${{ secrets.EMBEDDINGS_MODEL }}
+                SQS_QUEUE_URL=$(jq -r '.SQS_QUEUE_URL' deploy_config.json)
+                DELETE_SQS_URL=$(jq -r '.DELETE_SQS_URL' deploy_config.json)
+                FREE_TRAIL_DAYS=${{ secrets.FREE_TRAIL_DAYS }}
+                STRIPE_PUBLIC_KEY=${{ secrets.STRIPE_PUBLIC_KEY }}
+                STRIPE_SECRET_KEY=${{ secrets.STRIPE_SECRET_KEY }}
+                COMPLETE_PAY_STRIPE_COUPON_ID=${{ secrets.COMPLETE_PAY_STRIPE_COUPON_ID }}
+                COMPLETE_PAY_COUPON_CODE=${{ secrets.COMPLETE_PAY_COUPON_CODE }}
+                STRIPE_WEBHOOK_SECRET=$(jq -r '.STRIPE_WEBHOOK_SECRET' deploy_config.json)
+                TEIR2_CHATBOTS=${{ secrets.TEIR2_CHATBOTS }}
+                TEIR3_CHATBOTS=${{ secrets.TEIR3_CHATBOTS }}
+                GENERATE_IMAGE_SQS_URL=$(jq -r '.GENERATE_IMAGE_SQS_URL' deploy_config.json)
+                USER_REQUESTS_PER_X_SECONDS=${{ secrets.USER_REQUESTS_PER_X_SECONDS }}
+                USER_TOKENS_PER_X_SECONDS=${{ secrets.USER_TOKENS_PER_X_SECONDS }}
+                USER_UPLOADS_PER_X_SECONDS=${{ secrets.USER_UPLOADS_PER_X_SECONDS }}
+                USER_FILEUPLOADS_KEY_DURATION_SECONDS=${{ secrets.USER_FILEUPLOADS_KEY_DURATION_SECONDS }}
+
+                APP_REQUESTS_PER_X_SECONDS = ${{ secrets.APP_REQUESTS_PER_X_SECONDS }}
+                APP_TOKENS_PER_X_SECONDS = ${{ secrets.APP_TOKENS_PER_X_SECONDS }}
+                APP_UPLOADS_PER_X_SECONDS = ${{ secrets.APP_UPLOADS_PER_X_SECONDS }}
+                APP_FILEUPLOADS_KEY_DURATION_SECONDS = ${{ secrets.APP_FILEUPLOADS_KEY_DURATION_SECONDS }}
+                CHATBOT_SECRET_KEY=${{ secrets.CHATBOT_SECRET_KEY }}
+                FINGERPRINT_DURATION_SECONDS=${{ secrets.FINGERPRINT_DURATION_SECONDS }}
+                USER_KEY_DURATION_SECONDS=${{ secrets.USER_KEY_DURATION_SECONDS }}
+                APP_KEY_DURATION_SECONDS=${{ secrets.APP_KEY_DURATION_SECONDS }}
+
+                TOTAL_NO_OF_ALLOWED_DOCS = ${{ secrets.TOTAL_NO_OF_ALLOWED_DOCS }}
+                TOTAL_NO_OF_ALLOWED_URLS = ${{ secrets.TOTAL_NO_OF_ALLOWED_URLS }}
+                PER_URL_CHAR_CONTENT = ${{ secrets.PER_URL_CHAR_CONTENT }}
+                TOTAL_NO_OF_QAS = ${{ secrets.TOTAL_NO_OF_QAS }}
+                PER_QA_CHAR_LEN=${{ secrets.PER_QA_CHAR_LEN }}
+                TOTAL_NO_OF_GUARDRAILS=${{ secrets.TOTAL_NO_OF_GUARDRAILS }}
+                PER_GUARDRAILS_CHAR_LEN=${{ secrets.PER_GUARDRAILS_CHAR_LEN }}
+                TRANING_TEXT_CHAR_LENGTH=${{ secrets.TRANING_TEXT_CHAR_LENGTH }}
+
+                PER_DAYS_MESSAGES_FOR_FREMIUM = ${{ secrets.PER_DAYS_MESSAGES_FOR_FREMIUM }}
+                PER_DAYS_MESSAGES_FOR_FREE_TIER=${{ secrets.PER_DAYS_MESSAGES_FOR_FREE_TIER }}
+                PER_DAYS_MESSAGES_FOR_SUBSCRIBED=${{ secrets.PER_DAYS_MESSAGES_FOR_SUBSCRIBED }}
+                TOTAL_ALLOWED_USERS_FOR_PAID=${{ secrets.TOTAL_ALLOWED_USERS_FOR_PAID }}
+                TOTAL_NO_OF_ALLOWED_BULK_USERS=${{ secrets.TOTAL_NO_OF_ALLOWED_BULK_USERS }}
+
+                TOTAL_NO_OF_MEMORY=${{ secrets.TOTAL_NO_OF_MEMORY }}
+                PER_MEMORY_CHAR_LEN=${{ secrets.PER_MEMORY_CHAR_LEN }}
+                TOTAL_NO_OF_FEEDBACK_EACH_MESSAGE=${{ secrets.TOTAL_NO_OF_FEEDBACK_EACH_MESSAGE }}
+                PER_FEEDBACK_CHAR_LEN=${{ secrets.PER_FEEDBACK_CHAR_LEN }}
+                COOKIE_DOMAIN=${{ secrets.COOKIE_DOMAIN }}
+                BACKEND_CORS_ORIGINS=$(jq -r '.BACKEND_CORS_ORIGINS' deploy_config.json)
+                LANGSMITH_TRACING=$(jq -r '.LANGSMITH_TRACING' deploy_config.json)
+                LANGSMITH_ENDPOINT=$(jq -r '.LANGSMITH_ENDPOINT' deploy_config.json)
+                LANGSMITH_API_KEY=$(jq -r '.LANGSMITH_API_KEY' deploy_config.json)
+                LANGSMITH_PROJECT=$(jq -r '.LANGSMITH_PROJECT' deploy_config.json)
+                FREE_TIER_CHATBOTS=${{ secrets.FREE_TIER_CHATBOTS }}
+                FREE_TIER_USERS=${{ secrets.FREE_TIER_USERS }}
+                ADMIN_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM=${{ secrets.ADMIN_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM }}
+                PUBLIC_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM=${{ secrets.PUBLIC_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM }}
+                STRIPE_IMAGE_GENERATION_PRICE_ID=${{ secrets.STRIPE_IMAGE_GENERATION_PRICE_ID }}
+                STRIPE_STARTER_PRICE_ID=${{ secrets.STRIPE_STARTER_PRICE_ID }}
+                STRIPE_ENTERPRISE_PRICE_ID_YEARLY=$(jq -r '.STRIPE_ENTERPRISE_PRICE_ID_YEARLY' deploy_config.json)
+                STRIPE_ENTERPRISE_PRICE_ID_MONTHLY=$(jq -r '.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY' deploy_config.json)
+                EOF
+
+            # Step 3: Build and Tag Docker Image
+            - name: Build and Tag Docker Image
+              run: |
+                set -e
+                IMAGE_URI="${{ secrets.ECR_REPOSITORY }}:v200"
+                docker-compose -f docker-compose.yml build
+                docker tag fastapi_chat $IMAGE_URI 
+              env:
+                AWS_REGION: ${{ secrets.AWS_REGION }}
+                ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+            # Push docker image
+            - name: Push Docker Image to ECR
+              run: |
+                set -e
+                IMAGE_URI="${{ secrets.ECR_REPOSITORY }}:v200"
+                docker push $IMAGE_URI
+              env:
+                  AWS_REGION: ${{ secrets.AWS_REGION }}
+                  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+
+            # Step 7: Update ECS Service
+            - name: Update ECS Service
+              run: |
+                set -e
+                IMAGE_URI="${{ secrets.ECR_REPOSITORY }}:v200"
+                aws ecs update-service \
+                  --cluster dev-marti-ai-dev-cluster \
+                  --service dev-marti-ai-dev-service \
+                  --force-new-deployment \
+                  --region ${{ secrets.AWS_REGION }}
+              env:
+                AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                AWS_REGION: ${{ secrets.AWS_REGION }}
+
+            # Step 8: Delete Old Images
+            - name: Delete Old Docker Images from ECR
+              run: |
+                set -e
+                REPO_NAME=${{ secrets.ECR_REPOSITORY }}
+                
+                # Verify if the repository exists
+                REPO_EXISTS=$(aws ecr describe-repositories --region ${{ secrets.AWS_REGION }} --query "repositories[?repositoryName=='$REPO_NAME'] | length(@)")
+                if [ "$REPO_EXISTS" -eq 0 ]; then
+                  echo "Repository $REPO_NAME does not exist. Skipping deletion step."
+                  exit 0
+                fi
+
+                # List and delete old images
+                IMAGE_TAGS=$(aws ecr list-images \
+                  --repository-name $REPO_NAME \
+                  --region ${{ secrets.AWS_REGION }} \
+                  --query 'imageIds[?imageTag!=`v200`]' \
+                  --output json)
+
+                if [ "$IMAGE_TAGS" != "[]" ]; then
+                  echo "Deleting old images..."
+                  echo $IMAGE_TAGS | jq -c . | aws ecr batch-delete-image \
+                    --repository-name $REPO_NAME \
+                    --region ${{ secrets.AWS_REGION }} \
+                    --image-ids file://<(echo $IMAGE_TAGS)
+                else
+                  echo "No old images to delete."
+                fi
+              env:
+                AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                AWS_REGION: ${{ secrets.AWS_REGION }}    
+                
+            # Step 4: Deploy to your environment (optional)
+            - name: Deploy Backend Service
+              run: |
+                echo "Deploy steps go here. E.g., update ECS service or Lambda function."

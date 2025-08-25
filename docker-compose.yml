@@ -1,0 +1,74 @@
+version: "3.8"
+
+services: 
+  fastapi-service-chat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fastapi_chat 
+    container_name: fastapi_chat
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - chat-network
+    env_file:
+      - ./.env
+    volumes:
+      - .:/app/
+  
+  pg-service-chat:
+    image: postgres:latest
+    ports:
+      - 5432:5432
+    container_name: postgres_chat
+    environment:
+      POSTGRES_PASSWORD: $POSTGRES_PASSWORD 
+      POSTGRES_USER: $POSTGRES_USER         
+      POSTGRES_DB: $POSTGRES_DB 
+    networks:
+      - chat-network
+    volumes:
+      - chat_postgres_data:/var/lib/postgresql/data
+
+  adminer-service-chat:
+    image: adminer:latest
+    restart: unless-stopped
+    container_name: adminer-chat
+    depends_on:
+      - pg-service-chat
+    networks:
+      - chat-network
+    ports:
+      - "8090:8080"
+  
+  redis-service-chat:
+    image: redis/redis-stack-server:latest
+    restart: unless-stopped
+    container_name: redis-chat
+    networks:
+      - chat-network
+    ports:
+      - "6379:6379"
+    volumes:
+    - .:/data
+    environment:
+    - REDIS_ARGS=--maxmemory 100mb --maxmemory-policy allkeys-lru --requirepass redispassword --appendonly yes
+
+  smtp-service:
+    image: axllent/mailpit
+    restart: unless-stopped
+    container_name: smtp
+    networks:
+      - chat-network
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+networks:
+  chat-network:
+    driver: bridge
+    name: chat-network
+volumes:
+  chat_postgres_data:
+    name: chat_postgres_data
