@@ -178,7 +178,7 @@ async def run_socratic_agent(
         logger.error(f"Error in run_socratic_agent: {e}")
         raise e
 
-
+from typing import AsyncGenerator, Dict, Any
 async def stream_socratic_agent(
     thread_id: str,
     messages: list[BaseMessage],

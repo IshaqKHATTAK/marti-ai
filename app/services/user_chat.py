@@ -50,20 +50,26 @@ def configure_persistence(redis_client):
 
     print("Redis persistence configured with RDB and AOF")
 
-# redis_store = Redis(host=envs.REDIS_HOST, port=envs.REDIS_PORT, password = 'redispassword',decode_responses=True) #for local
+redis_store = Redis(
+    host=envs.REDIS_HOST, 
+    port=envs.REDIS_PORT, 
+    decode_responses=True,
+    username="default",
+    password="4ZLcWah0ofyql0KvynHmb30l94AwyBx2",
+    ) #for local
 
 logger = logging.getLogger(__name__)
 
 
-redis_store = RedisCluster(
-    host=envs.REDIS_HOST, 
-    port=envs.REDIS_PORT, 
-    ssl=True ,
-    decode_responses=True,
-    max_connections=50, # per-client pool limit (tune)
-    socket_connect_timeout=10, # seconds to establish TCP
-    socket_timeout=7, # seconds for commands
-    ) # AWS redis does not have auth applied.
+# redis_store = RedisCluster(
+#     host=envs.REDIS_HOST, 
+#     port=envs.REDIS_PORT, 
+#     ssl=True ,
+#     decode_responses=True,
+#     max_connections=50, # per-client pool limit (tune)
+#     socket_connect_timeout=10, # seconds to establish TCP
+#     socket_timeout=7, # seconds for commands
+#     ) # AWS redis does not have auth applied.
 
 
 # configure_persistence(redis_store)
