@@ -401,6 +401,9 @@ async def send_forgot_password_email(email: EmailStr, name: str, token: str):
     except Exception as e:
         print(f"Error sending email: {e}")
         raise 
+from datetime import datetime, timezone
+from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
 
 async def verify_email(
     token,
@@ -437,13 +440,15 @@ async def verify_email(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This link either expired or no more valid")
         # Update user verification status
         from app.services.user import verify_user_email
+
         user = await verify_user_email(db, useremail)
         
         stripeId = await payment.create_customer(user)
         if not stripeId:
             raise HTTPException(status_code=400, detail="Couldn't create stripe id for customer")
         user.stripeId = stripeId
-        
+        user.billing_cycle_start = datetime.now(timezone.utc)
+        user.billing_cycle_end = datetime.now(timezone.utc) + relativedelta(months=1)
         db.add(user)  # Ensure the user object is added to the session
         await db.commit()
         await db.refresh(user)

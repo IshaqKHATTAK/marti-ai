@@ -67,8 +67,6 @@ async def get_total_logs_count(organization_id, db, logs_type):
     count = result.scalar_one()
     return count
 
-
-
 async def update_chatbot_config(data, session):
     chatbot_setup = await _get_chatbot_config(data, session)
     if chatbot_setup is None:

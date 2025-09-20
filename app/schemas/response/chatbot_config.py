@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Optional, List
 from pydantic import BaseModel, HttpUrl
 from enum import Enum
 
@@ -68,6 +68,8 @@ class GetGuardrails(BaseModel):
 class ChatbotFileUpdateResponse(BaseModel):
     website_url: Optional[List[WebscrapUrl]] = []
     bot_documents: Optional[List[DocumentInfo]] = []
+    consumed_webscrap_size: Optional[Any] = 0
+    consumed_file_size: Optional[Any] = 0
 
 class UrlValidationResponse(BaseModel):
     valid: bool
@@ -88,16 +90,21 @@ class ChatbotConfigResponse(BaseModel):
     qa_templates: Optional[List[QATemplateData]] = []
     guardrails: Optional[List[GetGuardrails]] = []
     avatar: Optional[str] = None
+    scaffolding_level: Optional[str] = None
+    consumed_webscrap_size: Optional[Any] = 0
+    consumed_file_size: Optional[Any] = 0
     class Config:
         from_attributes = True
 
 class WebsiteUrlPagination(BaseModel):
     website_url: Optional[List[WebscrapUrl]] = []
     total_webiste: Optional[int] = 0
+    consumed_webscrap_size: Optional[Any] = 0
 
 class DocumentPagination(BaseModel):
     bot_documents: Optional[List[DocumentInfo]] = []
     total_documents: Optional[int] = 0
+    consumed_file_size: Optional[Any] = 0
 
 
 class KnowledgeBaseDoc(BaseModel):
@@ -123,15 +130,22 @@ class DocumentRemoved(BaseModel):
 class ChatbotPrompt(BaseModel):
     trianing_text: str
 
+class ScaffoldingLevel(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
 class DetailsRequest(BaseModel):
     chatbot_name: str
     chatbot_role: str
     avatar: Optional[str] = None
+    scaffolding_level: Optional[ScaffoldingLevel] = None
 from enum import Enum
 
 class LlmModelEnum(str, Enum):
-    gpt_40 = "gpt-4o"
-    gpt_40_mini = "gpt-4o-mini"
+    gpt_41 = "gpt-4.1"
+    gpt_41_mini = "gpt-4.1-mini"
+    gpt_5 = "gpt-5"
 
 class ImageGenerationLlmModelEnum(str, Enum):
     dall_e_2 = "dall-e-2"
@@ -154,10 +168,25 @@ class ChatBotCreation(BaseModel):
     avatar: str
     specilized_type: Optional[str] = None
     # llm_model_name: str
+
+class AllPreExistingChatbotResponse(BaseModel):
+    org_avatar: Optional[str] = None
+    chatbots: List[ChatBotCreation]
+
+class ListBots(ChatBotCreation):
+    used_messages: Optional[int] = None
+    allowed_messages: Optional[int]= None
+    
+class ListBotsForPlan(BaseModel):
+    chatbot_type: str
+    chatbot_name: str
+    specilized_type: Optional[str] = None
+    used_messages: Optional[int] = None
+    allowed_messages: Optional[int]= None
     
 class AllChatbotResponse(BaseModel):
     org_avatar: Optional[str] = None
-    chatbots: List[ChatBotCreation]
+    chatbots: List[ListBots]
 
 
 class Guardrails(BaseModel):

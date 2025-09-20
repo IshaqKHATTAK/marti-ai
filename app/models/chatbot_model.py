@@ -15,8 +15,13 @@ class UrlSweep(str, enum.Enum):
 
 class BotType(str, enum.Enum):
     internal = "internal"
-    teacher = "teacher"
+    student = "student"
     external = "external"
+
+class ScaffoldingLevel(str, enum.Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
 
 class FeedbackStatus(str, enum.Enum):
     Reviewed = "Reviewed"
@@ -36,6 +41,10 @@ class ChatbotConfig(Base):
         SQLAEnum(BotType, native_enum=False),
         nullable=True
     )
+    scaffolding_level = Column(
+        SQLAEnum(ScaffoldingLevel, native_enum=False),
+        nullable=True
+    )
     llm_model_name = Column(String(250), nullable=False, index=True, default=None)
     llm_temperature = Column(Numeric(2,2), nullable=False, default=None)
     llm_prompt = Column(Text, nullable=False, default=None)
@@ -50,6 +59,8 @@ class ChatbotConfig(Base):
     public_per_day_messages_count = Column(Integer, nullable=True,  default=0)
     # public_last_7_days_messages_count = Column(Integer, nullable=True,  default=0)
     public_last_7_days_messages = Column(JSON, nullable=True, default={})  
+    monthly_messages_count = Column(Integer, nullable=True, default=0)
+
     # Organization Relationship
     organization_id = Column(Integer, ForeignKey("organizations.id"))
     organization = relationship("Organization", back_populates="chatbots")
@@ -89,7 +100,7 @@ class ChatbotDocument(Base):
     status = Column(String(100), nullable=True, index=True, default=None)
     updated_at = Column(TIMESTAMP, nullable=True, default=None, onupdate=func.now())
     created_at = Column(TIMESTAMP, nullable=False, default=func.now())
-    
+    consumed_webscrap_quota_kb = Column(Integer, nullable=True, default=0)
     __table_args__ = (
         Index("idx_chatbot_id_document_name", "chatbot_id", "document_name"),
         Index("idx_chatbot_id_document_name_status", "chatbot_id", "document_name", "status"),
@@ -110,6 +121,7 @@ class Threads(Base):
     updated_timestamp = Column(TIMESTAMP, nullable=False, default=func.now(), onupdate=datetime.now)
     agent_generated_prompt =Column(Text, nullable=True)
     questions_counter = Column(Integer, nullable=True, default=0)
+    scaffolding_questions = Column(JSON, nullable=True, default=[])
     chatbot = relationship("ChatbotConfig", back_populates="bot_threads")
     messages = relationship("Messages", back_populates="thread", cascade="all, delete-orphan")
 
@@ -128,7 +140,8 @@ class Messages(Base):
     message_content = Column(Text, nullable=True)
     is_image = Column(Boolean,  default=False)
     is_revised = Column(Boolean,  default=False)
-    # image_description = Column(Text, nullable=True)
+    
+    is_simplify_on = Column(Boolean, nullable=True, default=False)
     images_urls = Column(ARRAY(String), nullable=True, default=[])
     created_timestamp = Column(TIMESTAMP, nullable=False, default=func.now())
     message_uuid = Column(String, unique=True, nullable=False)

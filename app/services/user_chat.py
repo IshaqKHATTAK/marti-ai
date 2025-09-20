@@ -1,13 +1,14 @@
-from app.utils.langchain_helper import generate_image, intent_classifier, _simple_prompt_assistant, load_llm_in_json_mode, format_user_question, construct_kb_chain, _create_moderation_chain, load_llm
+from app.utils.langchain_helper import load_llm, format_user_question, get_stream_ai_response, get_ai_response, _create_moderation_chain, load_llm_in_json_mode
 from app.models.chatbot_model import ChatbotConfig, ChatbotGuardrail
 from app.models.user import User, UserRole
 from sqlalchemy.future import select
 from app.common.env_config import get_envs_setting
 from fastapi import HTTPException,status
-from app.utils.database_helper import format_user_chatbot_permissions, start_scheduler,increment_chatbot_message_count, increment_public_chatbot_per_day_message_count,increment_chatbot_per_day_message_count,increment_admin_chatbot_message_count
+from app.utils.database_helper import check_and_refresh_chat_cycle, format_user_chatbot_permissions,increment_chatbot_message_count, increment_chatbot_monthly_message_count,increment_chatbot_per_day_message_count,increment_admin_chatbot_message_count
 # import redis
 from app.schemas.request.user_chat import UserChat
 import json
+from app.utils.db_helpers import get_user_organization_admin
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.request.user_chat import MessageFeedbackRequest, UserSecureChat, PublicMessageFeedbackRequest
 from app.models.chatbot_model import MessagesFeedbacks, FeedbackStatus
@@ -31,8 +32,8 @@ import ast
 from app.schemas.response.user_chat import AllThreadResponse, AllThreadResponseItem
 from urllib.parse import urlparse
 import asyncio
+from typing import AsyncGenerator, Dict, Any
 
-asyncio.create_task(start_scheduler())
 envs = get_envs_setting()
 
 import json
@@ -51,12 +52,19 @@ def configure_persistence(redis_client):
 
 # redis_store = Redis(host=envs.REDIS_HOST, port=envs.REDIS_PORT, password = 'redispassword',decode_responses=True) #for local
 
+logger = logging.getLogger(__name__)
+
 
 redis_store = RedisCluster(
     host=envs.REDIS_HOST, 
     port=envs.REDIS_PORT, 
     ssl=True ,
-    decode_responses=True) # AWS redis does not have auth applied.
+    decode_responses=True,
+    max_connections=50, # per-client pool limit (tune)
+    socket_connect_timeout=10, # seconds to establish TCP
+    socket_timeout=7, # seconds for commands
+    ) # AWS redis does not have auth applied.
+
 
 # configure_persistence(redis_store)
 # Initialize S3 client
@@ -205,6 +213,7 @@ async def generate_pre_signed_url(request, cur_user, org_id, session):
             raise HTTPException(status_code=400, detail="Missing required parameters")
     created_thread_id = 0
     presigned_urls = []
+    
     if upload_type == "profile":
         s3_key = f"profile/{cur_user.id}"
         for file_item in files:
@@ -375,6 +384,13 @@ async def generate_pre_signed_url(request, cur_user, org_id, session):
                 thread_id=created_thread_id
             ))
     elif upload_type == 'bulk_users':
+        if cur_user.role in [UserRole.SUPER_ADMIN, UserRole.USER]:
+            cur_user = await get_user_organization_admin(db = session, organization_id = org_id)
+            if cur_user.current_plan != Plan.enterprise:
+                raise HTTPException(
+                    status_code=443,
+                    detail="Please upgrade your plan to create users."
+                )
         for file_item in files:
             file_name = file_item.file_name
             file_types = file_item.file_type
@@ -540,13 +556,14 @@ async def get_public_thread_service(fingerprint_id):
     
     return existing_thread
 
+from app.models.user import Plan
 from app.services.organization import get_organization_chabot_name
 
 async def _get_chatbot_config(data, session):
     result = await session.execute(select(ChatbotConfig).filter(ChatbotConfig.id == data.bot_id)) 
     return result.scalars().first()
 
-async def _get_chatbot_config_by_id(bot_id, session):
+async def get_chatbot_config_by_id(bot_id, session):
     result = await session.execute(select(ChatbotConfig).filter(ChatbotConfig.id == bot_id)) 
     return result.scalars().first()
 
@@ -624,7 +641,6 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
             # seconds_till_next_minute = 60 - (time.time() % 60)
             print(f"ES: App request key will expire in {request_ttl} seconds.")
         
-
         # Get the remaining time to live (TTL) for a key
         token_ttl = await redis_store.ttl(user_token_key)
 
@@ -637,7 +653,6 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
         else:
             print(f"ES: The user token key will expire in {token_ttl} seconds.")
         
-
         if request_count >= envs.USER_REQUESTS_PER_X_SECONDS:
             raise HTTPException(status_code=429, detail=f"Thread message limit exceeded. Please try again after {request_ttl} seconds")
         
@@ -648,24 +663,42 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
         encrypted_bot_id = data.bot_id
         data.bot_id = _decrypt_chatbot_id(data.bot_id, fernet = fernet)
         print(f'bot id being extracted = {data.bot_id}')
-        bot_config = await _get_chatbot_config_by_id(int(data.bot_id), session)
+        bot_config = await get_chatbot_config_by_id(int(data.bot_id), session)
         org_admin = await _get_admin(organization_id=bot_config.organization_id, session=session)
-        if org_admin.current_plan == Plan.free:
-            if not org_admin.is_paid and bot_config.per_day_messages >= envs.PUBLIC_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM:
-                raise HTTPException(status_code=447, detail="Limit reached for chatting with bot. Pleaes upgrade your plan.")
-        
+
+        print(f'::bot_config.monthly_messages_count:: {bot_config.monthly_messages_count}')
+        if org_admin.current_plan == Plan.free and org_admin.is_paid:
+            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+                if not is_expired:
+                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+            if bot_config.per_day_messages >= envs.PUBLIC_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM:
+                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+                if not is_expired:
+                    raise HTTPException(status_code=404, detail="You have reached your daily message limit. Please upgrade your plan.")
+        elif org_admin.current_plan == Plan.starter:
+            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+                if not is_expired:
+                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+        elif org_admin.current_plan == Plan.enterprise:
+            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+                if not is_expired:
+                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit.")
+        elif org_admin.current_plan == Plan.free:
+            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+                if not is_expired:
+                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+            
+            
         if not bot_config:
             raise HTTPException(status_code=404, detail="Chatbot not found")
-        
-        background_tasks.add_task(
-            increment_public_chatbot_per_day_message_count,
-            chatbot = bot_config,
-            session = session
-        )
+
         llm_name  = await get_organization_chabot_name( db = session)
         # llm = load_llm(api_key=envs.OPENAI_API_KEY, name='gpt-4o', temperature=bot_config.llm_temperature)
-        llm = load_llm_in_json_mode(api_key=envs.OPENAI_API_KEY, name=llm_name if llm_name else "gpt-4o", temperature=bot_config.llm_temperature)
-
+        llm = load_llm(api_key=envs.OPENAI_API_KEY, name=llm_name if llm_name else "gpt-4.1", temperature=bot_config.llm_temperature)
 
         # llm = load_llm(api_key=envs.OPENAI_API_KEY, name=bot_config.llm_model_name, temperature=bot_config.llm_temperature)
         
@@ -723,86 +756,12 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
         image_description = None
         url_to_image = None
         image_generation = False
-        # if data.generate_image:
-        #     qa_chain = await construct_kb_chain(db_session=session, memory_status=chatbot.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = int(data.bot_id), user_id=1, org_id =organization_id , enable_image_generation=True, user_input = data.question)
-        #     print(f'history before invoke == {chat_history}')
-        #     response = await qa_chain.ainvoke({"input": question, "chat_history": chat_history})
-        #     print(f'response from invorke == {response}')
-        #     print(f"Response is {response.content}")
-        #     print(f"Type of response.content is {type(response.content)}")
-        #     print(f"Tool calls are {response.tool_calls}")
-
-        #     if response.tool_calls:
-        #         tool_call = response.tool_calls[0]
-        #         ###############
-        #         await redis_store.rpush(f"public:conversation:{fingerprint}:{thread_id}", json.dumps({"role": "human", "message": [{'type': 'text', 'text': data.question}]}))
-        #         await redis_store.rpush(f"public:conversation:{fingerprint}:{thread_id}", json.dumps({"role":"ai","message":[{"type": "text", "text": '',"additional_kwargs":response.additional_kwargs,"response_metadata":response.response_metadata,"id":response.id,"tool_calls":response.tool_calls}]}))
-        #         chat_history.append(response)
-
-        #         if tool_call["name"] == "generate_image":
-        #             print(f"Tool call is {tool_call}")
-        #             filtered_response = response.dict()  # Convert response object to a dictionary
-        #             filtered_response.pop("content", None)
-                    
-        #             message_body = {
-        #                     "image_description": tool_call["args"]["image_prompt"],
-        #                     "tool_call_id": tool_call["id"],
-        #                     "chatbot_id": encrypted_bot_id,
-        #                     "decrypted_bot_id":bot_config.id,
-        #                     "user_id": fingerprint,
-        #                     "thread_id": thread_id,
-        #                     "user_input":data.question,
-        #                     "uploader": "public"
-        #                 }
-
-        #             s3_response = sqs_client.send_message(
-        #                     QueueUrl=envs.GENERATE_IMAGE_SQS_URL,
-        #                     MessageBody=json.dumps(message_body),
-        #                     MessageGroupId=f"{str(uuid.uuid4())}-generate_img",
-        #                     MessageDeduplicationId=str(uuid.uuid4())
-        #                 )
-        #             print(f"Sent to SQS: {s3_response}")
-                   
-        #             image_generation = True
-        #             background_tasks.add_task(
-        #                 increment_chatbot_message_count,
-        #                 chatbot_id = bot_config.id,
-        #                 session = session
-        #                     )
-        #             # background_tasks.add_task(
-        #             #     increment_chatbot_per_day_message_count,
-        #             #     chatbot_id = bot_config.id,
-        #             #     session = session
-        #             #     )
-        #             return response, thread_id, image_generation
-                   
-        #     else:
-        #         print("Image generation was enabled but no tool calls are made")
-        #         json_object = json.loads(response.content)
-        #         # json_object = ast.literal_eval(response.content)
-        #         response = {"role": "assistant", "message": f"{json_object['answer']}"}
-                
-        #         print(f"Assistant: {response}")
-
-        # else:
-        qa_chain = await construct_kb_chain(db_session=session, memory_status=chatbot.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = int(data.bot_id),  org_id =organization_id, user_input = data.question) #  21 10 current_user.id  current_user.organization_id
-        # response = await qa_chain.ainvoke({"input": data.question, "chat_history": chat_history})
-        # print(f'response from else ==  {response}')
-        # response = {"role": "assistant", "message": f"{response.answer}"}
-
-        response = await qa_chain.ainvoke({"input": question, "chat_history": chat_history})
-        response_content = response.content if isinstance(response, AIMessage) else response.answer
+        response = await get_ai_response(db_session=session, memory_status=chatbot.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = int(data.bot_id),  org_id =organization_id, chat_history = chat_history, scaffolding_level =bot_config.scaffolding_level) #  21 10 current_user.id  current_user.organization_id
+        response_content = response["answer"]
         response = {"role": "assistant", "message": f"{response_content}"}
-            
-        # qa_chain = await construct_kb_chain(bot_config.llm_role, bot_config.llm_prompt, llm, data.bot_id, 1, organization_id, session)
-        # response = await qa_chain.ainvoke({"input": str(data.question), "chat_history": chat_history})
-        # print(f"Response from OpenAI: {response}")
-        # response = {"role": "assistant", "message": f"{response.answer}"}
-        # print(f"Response from OpenAI after serialization: {response}")
 
         llm_tokens = 100
-        # response, llm_tokens = await qa_chain({"input": str(data.question), "chat_history": chat_history})
-
+       
         if not await redis_store.exists(user_token_key):
             await redis_store.set(user_token_key, llm_tokens, ex=envs.USER_KEY_DURATION_SECONDS)
         else:
@@ -841,10 +800,17 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
             await redis_store.delete(lru_session_id)
         
         background_tasks.add_task(
+            increment_chatbot_monthly_message_count,
+            chatbot = bot_config,
+            session = session
+        )
+
+        background_tasks.add_task(
             increment_chatbot_message_count,
             chatbot_id = bot_config.id,
             session = session
-                )
+        )
+        
         # background_tasks.add_task(
         #     increment_chatbot_per_day_message_count,
         #     chatbot_id = bot_config.id,
@@ -854,18 +820,14 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
     
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    
-    
+
+
 
 async def chat_with_bot(data: UserChat, session, current_user, background_tasks: BackgroundTasks):
     # try:
-    
+    data.question = "Please simplify your above reponse." if data.is_simplify else data.question
     verified_time_limit = current_user.verified_at + timedelta(days=envs.FREE_TRAIL_DAYS)
-    # if current_user.role == UserRole.ADMIN and current_user.current_plan == Plan.free and datetime.now(timezone.utc) > verified_time_limit:
-    #     raise HTTPException(
-    #         status_code=403,
-    #         detail="You have completed your free trail time, Please upgrade your plan from Free tier."
-    #     )
+
     if current_user.role == UserRole.ADMIN:            
         # Get the chatbot first
         query = select(ChatbotConfig).filter(
@@ -909,10 +871,11 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
         from app.utils.db_helpers import get_user_organization_admin
         # admin = get_user_organization_admin(session, current_user.organization_id)
         admin = await _get_admin(organization_id=current_user.organization_id, session=session)
+            
         if (admin.current_plan in [Plan.starter]) or (admin.current_plan == Plan.free and datetime.now(timezone.utc) > verified_time_limit):
             if data.generate_image:
                 raise HTTPException(status_code=427, detail="Please ask your organization to upgrade plan for generate image.")
-   
+
         if admin.current_plan in [Plan.enterprise]:
             if data.generate_image:
                 if admin.add_on_features:
@@ -920,12 +883,34 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
                         raise HTTPException(status_code=427, detail="Please ask your organization to upgrade plan to generate image.")
                 else:
                     raise HTTPException(status_code=427, detail="Please ask your organization to upgrade plan to generate image.")
-
-    
+ 
+    bot_config = await _get_chatbot_config(data, session)
+    org_admin = await _get_admin(organization_id=bot_config.organization_id, session=session)
+    print(f'::bot_config.monthly_messages_count:: {bot_config.monthly_messages_count}')
+    if org_admin.current_plan == Plan.free and org_admin.is_paid:
+        if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+            is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+            if not is_expired:
+                raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+            print(f'no exception')
+    elif org_admin.current_plan == Plan.starter:
+        if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+            is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+            if not is_expired:    
+                raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+    elif org_admin.current_plan == Plan.enterprise:
+        if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+            is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+            if not is_expired:
+                raise HTTPException(status_code=404, detail="You have reached your monthly message limit.")
+    elif org_admin.current_plan == Plan.free:
+        if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
+            is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
+            if not is_expired:
+                raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+        
     question = await format_user_question(user_input=data.question, images_urls=data.images_urls)
     
-    print(f'question on top == {question["content"]}')
-    bot_config = await _get_chatbot_config(data, session)
     if current_user.role == UserRole.ADMIN:
         if current_user.current_plan == Plan.free and datetime.now(timezone.utc) > verified_time_limit and bot_config.admin_per_days_messages_count >= envs.ADMIN_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM:
             raise HTTPException(status_code=404, detail="Limit reached for chating with bot. Please upgrade your plans.")
@@ -941,7 +926,7 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
         raise HTTPException(status_code=404, detail="Chatbot not found")
     
     llm_name  = await get_organization_chabot_name( db = session)
-    llm = load_llm_in_json_mode(api_key=envs.OPENAI_API_KEY, name="gpt-4o", temperature=bot_config.llm_temperature) #llm_name if llm_name else 
+    llm = load_llm(api_key=envs.OPENAI_API_KEY, name=  llm_name if llm_name else "gpt-4.1", temperature=bot_config.llm_temperature) #"gpt-5"
     chat_history = []
     thread_id = data.id
     if not thread_id:
@@ -1014,17 +999,21 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
     image_description = None
     url_to_image = None
     image_generation = False
+
     # Create moderation chain
-    flag,moderation_response = await _create_moderation_chain(llm, guirdrails, user_input = data.question)
+    flag = True
+    moderation_response = None
+    if not data.is_simplify:
+        moderation_llm = load_llm_in_json_mode(api_key=envs.OPENAI_API_KEY, name=llm_name if llm_name else "gpt-4.1", temperature=bot_config.llm_temperature)
+        flag,moderation_response = await _create_moderation_chain(moderation_llm, guirdrails, user_input = data.question)
+    print(f'flag from moderation == {flag}')
     if not flag:
         response = {"role": "assistant", "message": f"{moderation_response}"}
         print(f'moderation response {response}')
-        
     else:
         if data.generate_image:
-            qa_chain = await construct_kb_chain(db_session=session, memory_status=bot_config.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = data.bot_id, org_id =current_user.organization_id , enable_image_generation=True, user_input = data.question,chatbot_type=bot_config.specialized_type, chat_history=chat_history,thread_id=thread_id)
-            print(f'history before invoke == {chat_history}')
-            response = await qa_chain.ainvoke({"input": question, "chat_history": chat_history})
+        # Create relevance check chain
+            response = await get_ai_response(db_session=session, memory_status=bot_config.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = data.bot_id, org_id =bot_config.organization_id, enable_image_generation=True, chatbot_type=bot_config.specialized_type, chat_history=chat_history,thread_id=thread_id, is_simplify = data.is_simplify,  scaffolding_level =bot_config.scaffolding_level)
             print(f'response from invorke == {response}')
             if response.tool_calls:
                 background_tasks.add_task(langchain_helper._add_message_database,
@@ -1035,7 +1024,8 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
                         is_image=True,
                         images_urls = data.images_urls,
                         db_session = session,
-                        organization_id = current_user.organization_id
+                        organization_id = current_user.organization_id,
+                        is_simplify_on = data.is_simplify
                     )
                 
                 tool_call = response.tool_calls[0]
@@ -1056,7 +1046,8 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
                         is_image=False,
                         images_urls=[str(tool_call["id"])],
                         db_session = session,
-                        organization_id = current_user.organization_id
+                        organization_id = current_user.organization_id,
+                        is_simplify_on = data.is_simplify
                     )
                     message_body = {
                             "image_description": tool_call["args"]["image_prompt"],
@@ -1099,19 +1090,28 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
                     return response, url_to_image, thread_id, image_generation, thread.created_timestamp, thread.updated_timestamp, message_uuid, False if data.id else True
 
             else:
-                json_object = json.loads(response.content)
+                json_object = json.loads(response)
                 response = {"role": "assistant", "message": f"{json_object['answer']}"}
-                
                 print(f"Assistant: {response}")
         else:
-            qa_chain = await construct_kb_chain(db_session=session, memory_status=bot_config.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = data.bot_id, org_id = current_user.organization_id, user_input = data.question, chatbot_type=bot_config.specialized_type, chat_history=chat_history,thread_id=thread_id) #  21 10  
-            print(f'history before invoke == {chat_history}')
+                # Regular chatbot flow
+                response = await get_ai_response(
+                    db_session=session, 
+                    memory_status=bot_config.memory_status, 
+                    LLM_ROLE=bot_config.llm_role, 
+                    llm = llm, 
+                    chatbot_id = data.bot_id, 
+                    org_id = bot_config.organization_id,
+                    chatbot_type=bot_config.specialized_type, 
+                    chat_history=chat_history,thread_id=thread_id, 
+                    is_simplify = data.is_simplify,  
+                    scaffolding_level =bot_config.scaffolding_level) #  21 10  
+                print(f'response from else ==  {response}')
+                response = {"role": "assistant", "message": f"{response['answer']}"}
             
-            response = await qa_chain.ainvoke({"input": question, "chat_history": chat_history})
-            print(f'response from else ==  {response}')
-            response = {"role": "assistant", "message": f"{response.answer}"}
-        
         print(f'response from openai {response}')
+        
+    
     await redis_store.rpush(f"private_{current_user.id}_{thread_id}", json.dumps({"role": "human", "message": question["content"]}))
     # await redis_store.rpush(str(thread_id), json.dumps({"role": "ai", "message": response}))
     # await redis_store.rpush(str(thread_id), json.dumps(response))
@@ -1125,6 +1125,7 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
         if lru_session_id_list:
             await redis_store.zrem("active_sessions", lru_session_id_list[0])
             await redis_store.delete(lru_session_id_list[0])
+   
     if data.images_urls:
         message_uuid = f"{thread_id}_{thread_id}_{uuid.uuid4()}"
         background_tasks.add_task(langchain_helper._add_message_database,
@@ -1135,7 +1136,8 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
             is_image=True,
             images_urls=data.images_urls,
             db_session = session,
-            organization_id = current_user.organization_id
+            organization_id = current_user.organization_id,
+            is_simplify_on = data.is_simplify
         )
     else:
         message_uuid = f"{thread_id}_{thread_id}_{uuid.uuid4()}"
@@ -1145,7 +1147,8 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
                                 role = 'User', 
                                 message = json.dumps(question["content"]), 
                                 db_session = session,
-                                organization_id = current_user.organization_id) 
+                                organization_id = current_user.organization_id,
+                                is_simplify_on = data.is_simplify) 
     
     message_uuid = f"{thread_id}_{thread_id}_{uuid.uuid4()}"
     background_tasks.add_task(langchain_helper._add_message_database,
@@ -1154,19 +1157,21 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
                                 role = 'Assistant', 
                                 message = response['message'], 
                                 db_session = session,
-                                organization_id = current_user.organization_id)    
+                                organization_id = current_user.organization_id,
+                                is_simplify_on = data.is_simplify)    
     result = await session.execute(select(Threads).filter(Threads.thread_id == thread_id))
     thread = result.scalars().first()
-    # background_tasks.add_task(
-    #         increment_chatbot_per_day_message_count,
-    #         chatbot_id = bot_config.id,
-    #         session = session
-    # )
+
     background_tasks.add_task(
             increment_chatbot_message_count,
             chatbot_id = bot_config.id,
             session = session
     )
+    background_tasks.add_task(
+            increment_chatbot_monthly_message_count,
+            chatbot = bot_config,
+            session = session
+        )
     if current_user.role == UserRole.ADMIN and bot_config.chatbot_type == "External":
         background_tasks.add_task(
                 increment_admin_chatbot_message_count,
@@ -1175,33 +1180,243 @@ async def chat_with_bot(data: UserChat, session, current_user, background_tasks:
         )  
     return response, url_to_image, thread_id, image_generation, thread.created_timestamp, thread.updated_timestamp, message_uuid, False if data.id else True
     
-    # except openai.BadRequestError as e:
-    #     print(f"OpenAI API request failed: {str(e)}")
-    #     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='The provided image URL is invalid or inaccessible. Please check the URL and try again.')
-        
-    # except Exception as e:
-    #     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Error in chatting with bot.')
-        
-        # error_response = e.response.json()
-        # error_message = error_response.get('error', {}).get('message', 'Unknown error occurred')
-        # error_code = e.response.status_code
-        # if error_code == 404:
-        #     raise HTTPException(
-        #         status_code=error_code,
-        #         detail=f"OpenAI API Error: {error_message}"
-        #     )
+
+async def stream_chat_with_bot(
+    bot_id: int,
+    data: UserChat,
+    session: AsyncSession,
+    user_id: str
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """
+    Stream chat responses while saving messages to database.
+    Emits dict chunks for SSE encoding in the route.
+
+    Events shape:
+      - connected: { new_chat, is_simplify, url_to_image, thread_id, message_id, created_at }
+      - generate:  { content, image_generation_flag, thread_id, message_id }
+      - finish:    { content, image_generation_flag, thread_id, message_id }
+    """
+    # Resolve current user
+    current_user = await _get_user(user_id, session)
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Copy payload to avoid external mutation and normalize fields
+    payload = UserChat(**data.dict())
+    payload.bot_id = bot_id
+    payload.question = "Please simplify your above reponse." if payload.is_simplify else payload.question
+
+    # Load bot config and LLM
+    bot_config = await get_chatbot_config_by_id(int(payload.bot_id), session)
+    if not bot_config:
+        raise HTTPException(status_code=404, detail="Chatbot not found")
+
+    llm_name = await get_organization_chabot_name(db=session)
+    llm = load_llm(api_key=envs.OPENAI_API_KEY, name=llm_name if llm_name else "gpt-4.1", temperature=bot_config.llm_temperature)
+
+    # Build chat history and thread
+    chat_history = []
+    thread_id = payload.id
+    new_chat = False
+    if not thread_id:
+        create_thread = Threads(
+            user_id=current_user.id,
+            chatbot_id=payload.bot_id,
+            title='New Chat',
+            title_manual_update=True,
+        )
+        session.add(create_thread)
+        await session.commit()
+        await session.refresh(create_thread)
+        thread_id = create_thread.thread_id
+        new_chat = True
+    else:
+        # Load recent history from redis/db
+        past_messages = await get_chat_messagegs(data=payload, current_user=current_user, session=session)
+        for msg in past_messages:
+            if msg["role"] == "ai":
+                message_content = msg.get("message", [{}])[0]
+                additional_kwargs = message_content.get("additional_kwargs", {})
+                if additional_kwargs:
+                    chat_history.append(
+                        AIMessage(
+                            content=message_content.get("text", ""),
+                            additional_kwargs=additional_kwargs,
+                            response_metadata=msg.get("response_metadata", {}),
+                            tool_calls=msg.get("tool_calls", [])
+                        )
+                    )
+                else:
+                    chat_history.append(AIMessage(content=msg["message"][0]["text"]))
+            elif msg["role"] == "human":
+                chat_history.append(HumanMessage(content=msg["message"]))
+            elif msg["role"] == "tool":
+                chat_history.append(ToolMessage(content=msg["message"][0]["text"], tool_call_id=msg["id"]))
+
+    # Format current user input
+    formatted = await format_user_question(user_input=payload.question, images_urls=payload.images_urls)
+    chat_history.append(HumanMessage(content=formatted["content"]))
+
+    # Initial event
+    message_uuid = f"{thread_id}_{thread_id}_{uuid.uuid4()}"
+    url_to_image = None
+    image_generation = False
+    yield {
+        "type": "connected",
+        "message": "Connected to chat stream",
+        "thread_id": thread_id,
+        "message_id": message_uuid,
+        "created_at": str(datetime.utcnow()),
+        "new_chat": new_chat,
+        "is_simplify": payload.is_simplify,
+        "url_to_image": url_to_image,
+    }
+
+    # Persist user message immediately
+    await redis_store.rpush(
+        f"private_{current_user.id}_{thread_id}",
+        json.dumps({"role": "human", "message": formatted["content"]})
+    )
+    await redis_store.expire(f"private_{current_user.id}_{thread_id}", envs.TIME_TO_LIVE_IN_SECONDS)
+
+    if payload.images_urls:
+        await langchain_helper._add_message_database(
+            thread_id=thread_id,
+            message_uuid=f"{thread_id}_{thread_id}_{uuid.uuid4()}",
+            role='User',
+            message=json.dumps(formatted["content"]),
+            is_image=True,
+            images_urls=payload.images_urls,
+            db_session=session,
+            organization_id=current_user.organization_id,
+            is_simplify_on=payload.is_simplify
+        )
+    else:
+        await langchain_helper._add_message_database(
+            thread_id=thread_id,
+            message_uuid=f"{thread_id}_{thread_id}_{uuid.uuid4()}",
+            role='User',
+            message=json.dumps(formatted["content"]),
+            db_session=session,
+            organization_id=current_user.organization_id,
+            is_simplify_on=payload.is_simplify
+        )
+    ai_response_content = ''
+    try:
+        # Generate assistant response
+        if payload.generate_image:
+            async for chunk in get_stream_ai_response(
+                db_session=session,
+                memory_status=bot_config.memory_status,
+                LLM_ROLE=bot_config.llm_role,
+                llm=llm,
+                chatbot_id=payload.bot_id,
+                org_id=bot_config.organization_id,
+                enable_image_generation=True,
+                chatbot_type=bot_config.specialized_type,
+                chat_history=chat_history,
+                thread_id=thread_id,
+                is_simplify=payload.is_simplify,
+                scaffolding_level=bot_config.scaffolding_level
+            ):
+                yield chunk
+                # Collect only actual AI content for database (exclude status messages)
+                if chunk.get("type") == "content":
+                    ai_response_content += chunk.get("content")
+
+            # If tool call present, mark image generation and persist Tool message
+            if chunk.get("type") == "tool_start" and chunk.get("tool_calls") == "image":
+                await redis_store.rpush(
+                    f"private_{current_user.id}_{thread_id}",
+                    json.dumps({"role":"ai","message":[{"type": "text", "text": '',"additional_kwargs":chunk.get("additional_kwargs"),"response_metadata":chunk.get("response_metadata"),"id":chunk.get("id"),"tool_calls":chunk.get("tool_calls")}]})
+                )
+                image_generation = True
+                tool_call = chunk.get("tool_calls")[0]
+                filtered_response = chunk.get("tool_calls")[0]
+                filtered_response.pop("content", None)
+                await langchain_helper._add_message_database(
+                    thread_id=thread_id,
+                    message_uuid=message_uuid,
+                    role='Tool',
+                    message=json.dumps(filtered_response),
+                    is_image=False,
+                    images_urls=[str(tool_call["id"])],
+                    db_session=session,
+                    organization_id=current_user.organization_id,
+                    is_simplify_on=payload.is_simplify
+                )
+                # Let the client know image generation started
+                yield {"type": "generate", "content": '', "image_generation_flag": True, "thread_id": thread_id, "message_id": message_uuid}
+                full_text = ''
+            else:
+                # Fallback textual content
+                json_object = json.loads(response)
+                full_text = f"{json_object['answer']}"
+        else:
+            response = await get_ai_response(
+                db_session=session,
+                memory_status=bot_config.memory_status,
+                LLM_ROLE=bot_config.llm_role,
+                llm=llm,
+                chatbot_id=payload.bot_id,
+                org_id=bot_config.organization_id,
+                chatbot_type=bot_config.specialized_type,
+                chat_history=chat_history,
+                thread_id=thread_id,
+                is_simplify=payload.is_simplify,
+                scaffolding_level=bot_config.scaffolding_level
+            )
+            if isinstance(response, dict) and 'answer' in response:
+                full_text = f"{response['answer']}"
+            else:
+                try:
+                    full_text = str(response["answer"])  # type: ignore
+                except Exception:
+                    full_text = str(response)
+
+        # Stream textual content in chunks
+        if not image_generation:
+            chunk_size = 120
+            for i in range(0, len(full_text), chunk_size):
+                part = full_text[i:i+chunk_size]
+                yield {"type": "generate", "content": part, "image_generation_flag": False, "thread_id": thread_id, "message_id": message_uuid}
+
+            # Save final assistant message
+            await redis_store.rpush(
+                f"private_{current_user.id}_{thread_id}",
+                json.dumps({"role":"ai","message":[{"type": "text", "text": full_text}]})
+            )
+            await redis_store.expire(f"private_{current_user.id}_{thread_id}", envs.TIME_TO_LIVE_IN_SECONDS)
+            await langchain_helper._add_message_database(
+                thread_id=thread_id,
+                message_uuid=f"{thread_id}_{thread_id}_{uuid.uuid4()}",
+                role='Assistant',
+                message=full_text,
+                db_session=session,
+                organization_id=current_user.organization_id,
+                is_simplify_on=payload.is_simplify
+            )
+
+        # Counters
+        if current_user.role == UserRole.ADMIN and bot_config.chatbot_type == "External":
+            await increment_admin_chatbot_message_count(chatbot_id=bot_config.id, session=session)
+        await increment_chatbot_message_count(chatbot_id=bot_config.id, session=session)
+        await increment_chatbot_monthly_message_count(chatbot=bot_config, session=session)
+
+        # Finish event
+        yield {"type": "finish", "content": '' if image_generation else full_text, "image_generation_flag": image_generation, "thread_id": thread_id, "message_id": message_uuid}
+
+    except Exception as e:
+        logger.error(f"Error in stream_chat_with_bot for thread {thread_id}: {e}")
+        yield {"error": f"Error: {str(e)}", "type": "error"}
+
+
 from sqlalchemy import func
 import math
 
 from app.schemas.response.user_chat import  GetMessagesResponseInternal
 async def get_route_chat_messagegs(data, current_user, session, offset: int, limit: int):
     try:
-        # all_keys = await redis_store.keys("*")
-        # print("Keys in Redis Before:", all_keys)
-        # await redis_store.flushdb()
-        # await redis_store.flushall()
-        # all_keys = await redis_store.keys("*")
-        # print("Keys in Redis After:", all_keys)
         print(f"Current user ID: {current_user.id}, Thread ID: {data.id}")
         user_thread = select(Threads).filter(
                 Threads.thread_id == data.id,
@@ -1227,9 +1442,6 @@ async def get_route_chat_messagegs(data, current_user, session, offset: int, lim
                     offset = -1
                 )            
             skip = total_messages - limit
-            
-            # no_of_pages = math.ceil(total_messages / page_size)
-            # skip = (no_of_pages -1) * page_size
             
         else:
             # skip = (page - 1) * page_size
@@ -2281,3 +2493,4 @@ async def delete_s3_object(s3_key: str):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+    return 

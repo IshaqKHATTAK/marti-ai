@@ -1,8 +1,8 @@
 """revised_table
 
-Revision ID: b894b102cd44
+Revision ID: a50b248ea467
 Revises: 
-Create Date: 2025-08-21 13:13:02.028575
+Create Date: 2025-09-10 06:55:22.855598
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = 'b894b102cd44'
+revision: str = 'a50b248ea467'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -76,7 +76,8 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('chatbot_name', sa.String(length=250), nullable=False),
     sa.Column('chatbot_type', sa.String(length=250), nullable=False),
-    sa.Column('specialized_type', sa.Enum('internal', 'teacher', 'external', name='bottype', native_enum=False), nullable=True),
+    sa.Column('specialized_type', sa.Enum('internal', 'student', 'external', name='bottype', native_enum=False), nullable=True),
+    sa.Column('scaffolding_level', sa.Enum('low', 'medium', 'high', name='scaffoldinglevel', native_enum=False), nullable=True),
     sa.Column('llm_model_name', sa.String(length=250), nullable=False),
     sa.Column('llm_temperature', sa.Numeric(precision=2, scale=2), nullable=False),
     sa.Column('llm_prompt', sa.Text(), nullable=False),
@@ -90,6 +91,7 @@ def upgrade() -> None:
     sa.Column('per_day_messages', sa.Integer(), nullable=True),
     sa.Column('public_per_day_messages_count', sa.Integer(), nullable=True),
     sa.Column('public_last_7_days_messages', sa.JSON(), nullable=True),
+    sa.Column('monthly_messages_count', sa.Integer(), nullable=True),
     sa.Column('organization_id', sa.Integer(), nullable=True),
     sa.ForeignKeyConstraint(['organization_id'], ['organizations.id'], ),
     sa.PrimaryKeyConstraint('id')
@@ -158,6 +160,8 @@ def upgrade() -> None:
     sa.Column('organization_id', sa.Integer(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('billing_cycle_start', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('billing_cycle_end', sa.DateTime(timezone=True), nullable=True),
     sa.Column('current_plan', sa.Enum('free', 'starter', 'enterprise', name='plan', native_enum=False), nullable=True),
     sa.Column('add_on_features', postgresql.ARRAY(sa.String()), nullable=True),
     sa.Column('country', sa.String(), nullable=True),
@@ -186,6 +190,7 @@ def upgrade() -> None:
     sa.Column('status', sa.String(length=100), nullable=True),
     sa.Column('updated_at', sa.TIMESTAMP(), nullable=True),
     sa.Column('created_at', sa.TIMESTAMP(), nullable=False),
+    sa.Column('consumed_webscrap_quota_kb', sa.Integer(), nullable=True),
     sa.ForeignKeyConstraint(['chatbot_id'], ['chatbot.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
@@ -277,6 +282,7 @@ def upgrade() -> None:
     sa.Column('updated_timestamp', sa.TIMESTAMP(), nullable=False),
     sa.Column('agent_generated_prompt', sa.Text(), nullable=True),
     sa.Column('questions_counter', sa.Integer(), nullable=True),
+    sa.Column('scaffolding_questions', sa.JSON(), nullable=True),
     sa.ForeignKeyConstraint(['chatbot_id'], ['chatbot.id'], ),
     sa.PrimaryKeyConstraint('thread_id')
     )
@@ -304,6 +310,7 @@ def upgrade() -> None:
     sa.Column('message_content', sa.Text(), nullable=True),
     sa.Column('is_image', sa.Boolean(), nullable=True),
     sa.Column('is_revised', sa.Boolean(), nullable=True),
+    sa.Column('is_simplify_on', sa.Boolean(), nullable=True),
     sa.Column('images_urls', postgresql.ARRAY(sa.String()), nullable=True),
     sa.Column('created_timestamp', sa.TIMESTAMP(), nullable=False),
     sa.Column('message_uuid', sa.String(), nullable=False),

@@ -9,10 +9,12 @@ class UserChat(BaseModel):
     bot_id: int
     question: str
     generate_image: bool
+    is_simplify: Optional[bool] = False
     images_urls: Optional[List[str]] = None
 
 class ExternalChat(UserChat):
     generate_image: bool
+    
 
 class ChatId(BaseModel):
     id: int
@@ -29,6 +31,7 @@ class UserSecureChat(BaseModel):
     question: str
     generate_image: bool
     images_urls: Optional[List[str]] = None
+    simplify: bool = False
 
 class MessageFeedbackRequest(BaseModel):
     bot_id: int

@@ -1,3 +1,4 @@
+from langchain_community.embeddings import awa
 from app.common.env_config import get_envs_setting
 import stripe
 from stripe import Subscription
@@ -9,12 +10,34 @@ from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.future import select
 from sqlalchemy.orm.attributes import flag_modified
-
+from app.schemas.response.chatbot_config import ListBotsForPlan
+from app.services.organization import fech_allowed_usage_per_admin, list_organization_chatbots_service
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 settings = get_envs_setting()
 # This is your test secret API key.
 stripe.api_key = settings.STRIPE_SECRET_KEY
+
+
+async def get_usage_for_plan(db: AsyncSession, organization_id: int, current_user: User, cateogry_indicator: int = 0):
+    response = []
+    
+    chatbots =  await list_organization_chatbots_service(db, organization_id, current_user, cateogry_indicator)
+    for chatbot in chatbots:
+            
+            allowed_messages = await fech_allowed_usage_per_admin(chatbot, session=db)
+            response.append(ListBotsForPlan(
+            chatbot_type=chatbot.chatbot_type,
+            chatbot_name=chatbot.chatbot_name,
+            specilized_type = chatbot.specialized_type,
+            used_messages=chatbot.monthly_messages_count // 2 if chatbot.monthly_messages_count else 0,
+            allowed_messages=allowed_messages // 2
+        ))
+            
+    return response
+
+
 
 class SubscriptionStatus(BaseModel):
     plan: Plan
@@ -220,6 +243,8 @@ async def get_current_user_seats(
         if item.price.product == user_product_id:
             return item.quantity or 0
     return 0
+
+
 async def update_payment_details(customer_id, subscription_id, session):
     result = await session.execute(select(User).where(User.stripeId == customer_id))
     user = result.scalars().first()
@@ -355,6 +380,34 @@ async def handle_invoice_update(data_object, session):
     await session.refresh(user)
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from dateutil.relativedelta import relativedelta
+
+
+async def add_billing_start_period(
+    db: AsyncSession,
+    customer_id: int,
+    start_timestamp: int
+):
+     # Convert Stripe timestamp (seconds) to datetime (UTC)
+    start_date = datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
+    result = await db.execute(select(User).where(User.stripeId == customer_id))
+    current_user = result.scalars().first()
+
+    if not current_user:
+        raise HTTPException(status_code=400, detail="User not found")
+
+    # Update user record
+    current_user.billing_cycle_start = start_date
+    current_user.billing_cycle_end = datetime.now(timezone.utc) + relativedelta(months=1)
+    # Persist to DB
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+
+    return current_user
+
 
 async def adjust_tier_degration_change(
         db: AsyncSession,

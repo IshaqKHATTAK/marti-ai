@@ -17,3 +17,4 @@ app/main_test.py
 /documents*
 /static*
 test.json
+.vscode

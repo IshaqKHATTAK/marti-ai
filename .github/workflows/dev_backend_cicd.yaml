@@ -88,8 +88,8 @@ jobs:
                 SQS_QUEUE_URL=$(jq -r '.SQS_QUEUE_URL' deploy_config.json)
                 DELETE_SQS_URL=$(jq -r '.DELETE_SQS_URL' deploy_config.json)
                 FREE_TRAIL_DAYS=${{ secrets.FREE_TRAIL_DAYS }}
-                STRIPE_PUBLIC_KEY=${{ secrets.STRIPE_PUBLIC_KEY }}
-                STRIPE_SECRET_KEY=${{ secrets.STRIPE_SECRET_KEY }}
+                STRIPE_PUBLIC_KEY=$(jq -r '.STRIPE_PUBLIC_KEY' deploy_config.json) 
+                STRIPE_SECRET_KEY=$(jq -r '.STRIPE_SECRET_KEY' deploy_config.json)
                 COMPLETE_PAY_STRIPE_COUPON_ID=${{ secrets.COMPLETE_PAY_STRIPE_COUPON_ID }}
                 COMPLETE_PAY_COUPON_CODE=${{ secrets.COMPLETE_PAY_COUPON_CODE }}
                 STRIPE_WEBHOOK_SECRET=$(jq -r '.STRIPE_WEBHOOK_SECRET' deploy_config.json)
@@ -143,7 +143,26 @@ jobs:
                 STRIPE_STARTER_PRICE_ID=${{ secrets.STRIPE_STARTER_PRICE_ID }}
                 STRIPE_ENTERPRISE_PRICE_ID_YEARLY=$(jq -r '.STRIPE_ENTERPRISE_PRICE_ID_YEARLY' deploy_config.json)
                 STRIPE_ENTERPRISE_PRICE_ID_MONTHLY=$(jq -r '.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY' deploy_config.json)
+                STRIPE_ENTERPRISE_USER_PRICE_ID_MONTHLY=$(jq -r '.STRIPE_ENTERPRISE_USER_PRICE_ID_MONTHLY' deploy_config.json)
+                STRIPE_ENTERPRISE_USER_PRICE_ID_YEARLY=$(jq -r '.STRIPE_ENTERPRISE_USER_PRICE_ID_YEARLY' deploy_config.json)
+                STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)
+                FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)
+                ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)
+                ENTERPRISE_PLAN_INTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.ENTERPRISE_PLAN_INTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)
                 EOF
+
+            # 🔎 Debug: Print the plan values
+            - name: Debug Plan Variables
+              run: |
+                echo "STRIPE_ENTERPRISE_PRICE_ID_MONTHLY=$(jq -r '.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY' deploy_config.json)"
+                echo "STRIPE_ENTERPRISE_PRICE_ID_YEARLY=$(jq -r '.STRIPE_ENTERPRISE_PRICE_ID_YEARLY' deploy_config.json)"
+                echo "STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)"
+                echo "FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)"
+                echo "ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)"
+                echo "ENTERPRISE_PLAN_INTERNAL_BOT_MONTHLY_MESSAGES=$(jq -r '.ENTERPRISE_PLAN_INTERNAL_BOT_MONTHLY_MESSAGES' deploy_config.json)"
+                
+                echo "----- FULL .env FILE -----"
+                cat .env
 
             # Step 3: Build and Tag Docker Image
             - name: Build and Tag Docker Image

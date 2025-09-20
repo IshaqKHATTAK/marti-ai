@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status, UploadFile, File
+from sqlalchemy.util import b
 from app.models.organization import Organization
 from app.models.user import User, UserRole, Plan
 from app.models.chatbot_model import ChatbotSettings, MessagesFeedbacks, FeedbackStatus, BubbleSettings
@@ -36,8 +37,9 @@ import pandas as pd
 from app.common.env_config import get_envs_setting
 import boto3
 import json
+from app.utils.db_helpers import get_user_organization_admin
 import uuid
-
+from app.schemas.response.organization import UpdateOrganization, UpdateUserProfile
 
 envs = get_envs_setting()
 
@@ -60,6 +62,12 @@ def normalize_url(url: str) -> str:
     return normalized
 
 
+async def _get_admin(organization_id, session):
+    result = await session.execute(
+        select(User).where(User.organization_id == organization_id, User.role == UserRole.ADMIN)
+    )
+    return result.scalars().first()
+
 async def _get_all_org_users(organization_id, db):
     users = await db.execute(select(User).filter(User.organization_id == organization_id))
     return users.scalars().all()
@@ -77,6 +85,13 @@ async def create_bulk_user_service(
     if current_user.current_plan == Plan.starter:
         raise HTTPException(status_code=400, detail=f"Please upgrade your plan to create users.")
     
+
+    if current_user.current_plan == Plan.starter:
+        raise HTTPException(
+            status_code=400,
+            detail="User creation is not available on the Starter plan. Please upgrade to Enterprise plan to create users."
+        )
+
     organization = await get_organization(db, organization_id)
     
     if not file.filename.endswith(('.csv', '.xlsx')):
@@ -106,7 +121,7 @@ async def create_bulk_user_service(
             status_code=400,
             detail="Maximum number of users exceeded. Please limit to 200 users per upload."
         )
-    
+     
     users = await _get_all_org_users(organization_id = organization_id, db = db)
     if current_user.current_plan == Plan.free: #and not current_user.is_active and (len(users)-1) >= envs.FREE_TIER_USERS
         if not current_user.is_paid:
@@ -192,7 +207,7 @@ async def list_all_organizations_service(
         total_organizations=total_organizations
     )
 
-from app.utils.db_helpers import get_user_organization_admin
+
 async def create_organization_user_service(
     db: AsyncSession,
     organization_id: int,
@@ -204,8 +219,13 @@ async def create_organization_user_service(
     
     await _role_based_checks(current_user, organization_id)
 
-    if current_user.role == UserRole.SUPER_ADMIN:
+    if current_user.role in [UserRole.SUPER_ADMIN, UserRole.USER]:
         current_user = await get_user_organization_admin(db = db, organization_id = organization_id)
+    if current_user.current_plan != Plan.enterprise:
+        raise HTTPException(
+            status_code=400,
+            detail="To create organization users you must have enterprise subscription."
+        )
     #-------------------------------------------THIS NEEDS TO BE COMMENT REMOVED.------------------------------------------------------------------------
     # from app.services.payment import allowed_users_checks
     # users_falg = await allowed_users_checks(db, current_user.stripeId)
@@ -220,7 +240,7 @@ async def create_organization_user_service(
             status_code=400,
             detail="Password and confirm password does not match."
         )
-    
+   
     users = await _get_all_org_users(organization_id = organization_id, db = db)
     print(f'user len = {len(users)} envs = {envs.FREE_TIER_USERS} and active == {current_user.is_active}')
     user_group_ids = []
@@ -278,22 +298,6 @@ async def create_organization_user_service(
     from app.services.user import create_user_in_organization
     created_user =  await create_user_in_organization(db, user_data, organization.id)
     
-    # for chatid in user_data.chatbot_ids:
-    #         chatbots_query = select(ChatbotConfig).filter(ChatbotConfig.id == chatid)
-    #         chatbots_result = await db.execute(chatbots_query)
-    #         chatbot = chatbots_result.scalar_one_or_none()
-    #         if chatbot:
-    #             user_chatbots.append(ChatbotInfo(
-    #             chatbot_id=int(chatbot.id),
-    #             chatbot_name=str(chatbot.chatbot_name)
-    #             ).model_dump())
-    
-    # user_groups = []
-    # for group_id in created_user.group_ids:
-    #     user_group_detials = await get_rbac_groups_by_id(db, organization.id, group_id)
-    #     if user_group_detials:
-    #         user_groups.extend(user_group_detials.attributes)
-
     user_groups, _ = await format_user_chatbot_permissions(db,current_user.organization_id, current_user.group_ids)
     userresponse = UserResponseCreate(
                 id=created_user.id,
@@ -347,7 +351,6 @@ async def super_admin_list_organization_users_service(
         total_users=len(users)
     )
     return response
-from app.schemas.response.organization import UpdateOrganization, UpdateUserProfile
 
 async def fetch_organization_profile(db: AsyncSession, organization_id: int, current_user):
     """
@@ -547,9 +550,14 @@ async def list_chatbot_urls(
                 print(f'Deleted the entry with upload status.')
                 await db.delete(doc)
         # ---------- Return Combined Paginated Response ---------- # 
+    
+    
+    webscrap_size = await get_total_chatbot_webscrap_size(db, organization_id, chatbot_id, current_user)
+        
     return WebsiteUrlPagination(
                 website_url=urls,
-                total_webiste=total_urls
+                total_webiste=total_urls,
+                consumed_webscrap_size = webscrap_size
             )
 
     # return KnowledgeBaseDoc(
@@ -638,10 +646,11 @@ async def list_chatbot_docs(
             if current_time - doc.created_at > timedelta(minutes=5):
                 print(f'Deleted the entry with upload status.')
                 await db.delete(doc)
-
+    file_size = await get_total_chatbot_filesize(db, organization_id, chatbot_id)
     return DocumentPagination(
                 bot_documents=bot_documents,
-                total_documents=total_documents
+                total_documents=total_documents,
+                consumed_file_size = file_size
             )
 
 
@@ -856,33 +865,30 @@ async def create_organization_chatbot_service(
     bot_type = None
 ) -> ChatbotConfig:
     """Create a chatbot with permission check"""
-    # Force role to be string for comparison
-    if current_user.role == UserRole.SUPER_ADMIN:
-        user_data = await get_user_organization_admin(db = db, organization_id = organization_id)
-        user_role = user_data.role
-    else:
-        user_role = current_user.role
-
     # Explicit role check
-    if user_role == UserRole.USER:
+    if current_user.current_plan == UserRole.USER:
         raise HTTPException(
             status_code=403,
-            detail=f"Regular users cannot create chatbots. Your role: {user_role}"
+            detail=f"Regular users cannot create chatbots."
+        )
+    
+    # Force role to be string for comparison
+    if current_user.role == UserRole.SUPER_ADMIN:
+        current_user = await get_user_organization_admin(db = db, organization_id = organization_id)
+        
+    if current_user.current_plan != Plan.enterprise:
+        raise HTTPException(
+            status_code=403,
+            detail="To create a chatbot you must have enterprise subscription."
         )
     
     # Admin organization check
-    if user_role == UserRole.ADMIN and current_user.organization_id != organization_id:
+    if current_user.current_plan == UserRole.ADMIN and current_user.organization_id != organization_id:
         raise HTTPException(
             status_code=403,
             detail="You can only create chatbots for your organization"
         )
-    
-    if user_role == UserRole.ADMIN and current_user.current_plan == Plan.starter:
-        raise HTTPException(
-            status_code=403,
-            detail="Please upgrade your plan."
-        )
-    
+
     query = select(ChatbotConfig).filter(
         ChatbotConfig.organization_id == organization_id
     )
@@ -890,6 +896,12 @@ async def create_organization_chatbot_service(
     result = await db.execute(query)
     admin_chatbots = result.scalars().all()
 
+    for chatbot in admin_chatbots:
+        if bot_type == BotType.student and chatbot.specialized_type == "student":
+            raise HTTPException(
+            status_code=403,
+            detail="You already have one student agent created."
+        )
     chatbotnames = [chatbot.chatbot_name for chatbot in admin_chatbots]
     if chatbot_data.chatbot_name in chatbotnames:
         raise HTTPException(
@@ -897,47 +909,27 @@ async def create_organization_chatbot_service(
             detail="You can't create chatbot with same name."
         )
     
-    print(f"bots == {len(admin_chatbots) - 1} bot env = {envs.FREE_TIER_CHATBOTS} active option = {current_user.is_active}")
-    if user_role == UserRole.ADMIN:
-        print(f'inside admin')
-        if current_user.current_plan == Plan.free:
-            print(f'inside free')
-            raise HTTPException(
-                    status_code=400,
-                    detail="Free users without a paid plan cannot create a chatbot."
-                )
-            # if not current_user.is_paid:
-            #     raise HTTPException(
-            #         status_code=400,
-            #         detail="Free users without a paid plan cannot create a chatbot."
-            #     )
-            # if (len(admin_chatbots) - 1) >= envs.FREE_TIER_CHATBOTS:
-            #     raise HTTPException(
-            #         status_code=400,
-            #         detail="Please upgrade your plan to create a chatbot."
-            #     )
-           
-    #(admin_chatbots - 1) -1 to remove the external chatbot
-    # if (len(admin_chatbots) - 1) >= envs.TEIR2_CHATBOTS and current_user.current_plan == Plan.tier_2:
-    #     raise HTTPException(
-    #         status_code=403,
-    #         detail="You have reached your chatbots limit please upgrade your plan."
-    #     )
-    if (len(admin_chatbots)- 1) >= envs.TEIR3_CHATBOTS and current_user.current_plan == Plan.starter:
-        raise HTTPException(
-            status_code=403,
-            detail="You have reached your chatbots limit."
-        )
-    if bot_type == BotType.teacher:
+    
+    if bot_type == BotType.student:
         from app.services.user import create_student_agent
         print(f'bot type -- ={bot_type}')
-        chatbot = await create_student_agent(
-            org_id = organization_id,
-            db = db,
-            llm_name = chatbot_data.llm_model_name,
-            llm_tone = chatbot_data.llm_role,
-            bot_type = bot_type
+        chatbot = ChatbotConfig(
+            chatbot_name = chatbot_data.chatbot_name,
+            organization_id = organization_id,
+            llm_model_name = chatbot_data.llm_model_name,
+            llm_prompt = chatbot_data.llm_prompt,
+            llm_role = chatbot_data.llm_role,
+            chatbot_type = 'Internal',
+            prompt_status = "Uploaded",
+            specialized_type = bot_type,
+            scaffolding_level = getattr(chatbot_data, 'scaffolding_level', None),
+            avatar_url=avatar,
+            llm_temperature=chatbot_data.llm_temperature,
+            llm_streaming=chatbot_data.llm_streaming if chatbot_data.llm_streaming is not None else True
         )
+        db.add(chatbot)
+        await db.commit()
+        await db.refresh(chatbot)
     else:
         # Create chatbot
         chatbot = ChatbotConfig(
@@ -947,8 +939,9 @@ async def create_organization_chatbot_service(
             llm_prompt=chatbot_data.llm_prompt,
             llm_role=chatbot_data.llm_role,
             prompt_status = "Uploaded",
-            chatbot_type = 'Internal',
+            chatbot_type ='Internal',
             chatbot_name = chatbot_data.chatbot_name,
+            scaffolding_level = getattr(chatbot_data, 'scaffolding_level', None),
             avatar_url=avatar,
             llm_streaming=chatbot_data.llm_streaming if chatbot_data.llm_streaming is not None else True
         )
@@ -1128,22 +1121,29 @@ async def list_platform_pre_existing_agents(current_user):
                 "chatbot_type": "Internal",
                 "chatbot_name": "Student Agent",
                 "avatar_url": "",
-                # "llm_model_name": "gpt-4"
-            },
-            {
-                "chatbot_type": "Internal",
-                "chatbot_name": "Teacher Agent",
-                "avatar_url": "",
+                "specilized_type":"student"
                 # "llm_model_name": "gpt-4"
             }
         ]
     return pre_existing_chatbots
 
+async def fech_allowed_usage_per_admin(bot_config, session):
+    org_admin = await _get_admin(organization_id=bot_config.organization_id, session=session)
+    if org_admin.current_plan == Plan.free and org_admin.is_paid:
+        return envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES
+    elif org_admin.current_plan == Plan.starter:
+        return envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES
+    elif org_admin.current_plan == Plan.enterprise:
+        return envs.ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES
+    elif org_admin.current_plan == Plan.free:
+        return envs.FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES
+    return 0
+
 async def list_organization_chatbots_service(
     db: AsyncSession,
     organization_id: int,
     current_user: User,
-    cateogry_indicator : int = 0 #1-insight, 2-chatlog
+    cateogry_indicator : int = 0 # 1-insight, 2-chatlog
 ) -> List[ChatbotConfig]:
     """List chatbots with permission check"""
     
@@ -1210,11 +1210,12 @@ def get_s3_file_size(file_url):
         print(f"Error retrieving file size: {e}")
         return 0.0
 
-async def get_total_chatbot_filesize(
+
+async def get_total_chatbot_webscrap_size(
         db: AsyncSession,
-    organization_id: int,
-    chatbot_id: int,
-    current_user: User
+        organization_id: int,
+        chatbot_id: int,
+        current_user: User
 ):
     # await _role_based_checks(current_user, organization_id)
     if current_user.role == UserRole.USER:
@@ -1235,6 +1236,21 @@ async def get_total_chatbot_filesize(
     else:
         await _fine_grain_role_checks(current_user, organization_id)
 
+    used_quota = await get_total_consumed_webscrap_quota_for_chatbot(db, chatbot_id)
+    print(f'retunred used quota: {used_quota}')
+    return used_quota/1024 if used_quota else 0
+    
+
+async def get_file_and_webscrap_sizes_for_chatbot():
+
+    return {"allowed_files_size": 10*2024, "allowed_webscrap_size":51200} #Size in kbs (10MB, 50MB)
+
+async def get_total_chatbot_filesize(
+    db: AsyncSession,
+    organization_id: int,
+    chatbot_id: int,
+):
+    print(f'get total chatbot filesize')
     query = (
         select(ChatbotConfig)
         .filter(
@@ -1247,6 +1263,7 @@ async def get_total_chatbot_filesize(
     chatbot = result.scalar_one_or_none()
     if not chatbot:
         raise HTTPException(status_code=404, detail="Chatbot not found")
+    print(f'get total chatbot filesize after chatbot')
     # Fetch documents
     documents_query = (
         select(ChatbotDocument)
@@ -1254,6 +1271,7 @@ async def get_total_chatbot_filesize(
     )
     documents_result = await db.execute(documents_query)
     documents_data = documents_result.scalars().all()
+    print(f'documents retrived: - {len(documents_data)}')
     total_size_in_kb = 0
     for doc in documents_data:
         if doc.content_type != "url":
@@ -1262,9 +1280,59 @@ async def get_total_chatbot_filesize(
             file_size_kb = get_s3_file_size(doc.document_name)
             total_size_in_kb += file_size_kb
 
-    return {"total_files_size":total_size_in_kb}
+    return total_size_in_kb
 
-async def get_organization_chatbot_service(
+async def update_bot_streaming(
+    db: AsyncSession,
+    organization_id: int,
+    chatbot_id: int,
+    current_user: User
+    ):
+    try:
+        if current_user.role == UserRole.USER:
+            if not current_user.group_ids:
+                raise HTTPException(status_code=404, detail="You don't have permission.")
+            # for group_id in current_user.group_ids:
+            #     #Extract gropu information and extract ids from groups.
+            #     group_details = await get_rbac_groups_by_id(db, current_user.organization_id, group_id)
+            user_groups, _ = await format_user_chatbot_permissions(db, current_user.organization_id, current_user.group_ids)
+            bot_details = None
+            for bot_info in user_groups:
+                if bot_info['chatbot_id'] == chatbot_id:
+                    bot_details = bot_info
+                    break
+            print(f'bot info == {bot_details}')
+            if bot_details:
+                await _fine_grain_role_checks(current_user, organization_id, chatbot_id, bot_details)
+        else:
+            await _fine_grain_role_checks(current_user, organization_id)
+
+        query = (
+            select(ChatbotConfig)
+            .filter(
+                ChatbotConfig.id == chatbot_id,
+                ChatbotConfig.organization_id == organization_id
+            )
+        )
+        
+        result = await db.execute(query)
+        chatbot = result.scalar_one_or_none()
+        if not chatbot:
+            raise HTTPException(status_code=404, detail="Chatbot not found")
+        chatbot.llm_streaming = not chatbot.llm_streaming
+        db.add(chatbot)
+        await db.commit()
+        await db.refresh(chatbot)
+        return {'agent_streaming':chatbot.llm_streaming}
+    
+    except HTTPException as http_ex:
+        raise http_ex  
+    except Exception as ex:
+        await db.rollback() 
+        raise HTTPException(status_code=500, detail=f"There is some errro while updating agent streaming.")
+
+
+async def get_organization_chatbot_service( 
     db: AsyncSession,
     organization_id: int,
     chatbot_id: int,
@@ -1388,6 +1456,11 @@ async def get_organization_chatbot_service(
             ]
         
         await db.commit()
+
+        used_quota = await get_total_consumed_webscrap_quota_for_chatbot(db, chatbot_id)
+        print(f'retunred used quota: {used_quota}')
+        file_size = await get_total_chatbot_filesize(db, organization_id, chatbot_id)
+        print(f'retunred used file_size quota: {file_size}')
         return ChatbotConfigResponse(
             id=chatbot.id,
             llm_model_name=chatbot.llm_model_name,
@@ -1402,7 +1475,10 @@ async def get_organization_chatbot_service(
             website_url=urls,
             bot_documents=bot_documents,
             qa_templates=qa_templates_data,
-            guardrails=guard_rails_data_prepared
+            guardrails=guard_rails_data_prepared,
+            scaffolding_level = chatbot.scaffolding_level,
+            consumed_webscrap_size = used_quota/1024 if used_quota else 0,
+            consumed_file_size = file_size
         )
     except HTTPException as http_ex:
         raise http_ex  
@@ -1468,7 +1544,8 @@ async def update_organization_chatbot_details(
     chatbot_name,
     chatbot_role,
     current_user: User,
-    avatar
+    avatar,
+    scaffolding_level = None
 ):
     await _role_based_checks(current_user, organization_id)
     # Get the chatbot first
@@ -1485,6 +1562,11 @@ async def update_organization_chatbot_details(
     
     chatbot.chatbot_name = chatbot_name
     chatbot.llm_role = chatbot_role
+    if chatbot.specialized_type != BotType.student and scaffolding_level is not None:
+        raise HTTPException(status_code=404, detail="Chatbot not found")
+
+    if scaffolding_level is not None:
+        chatbot.scaffolding_level = scaffolding_level
     db.add(chatbot)
     await db.commit()
     await db.refresh(chatbot)
@@ -1700,6 +1782,33 @@ async def get_total_documents_for_chatbot(db_session, chatbot_id: int, uploaded_
     total_documents = result.scalar()  # Returns the count as an integer
     return total_documents
 
+async def get_total_consumed_webscrap_quota_for_chatbot(db_session, chatbot_id: int) -> int:
+    print(f"[DEBUG] Starting get_total_consumed_webscrap_quota_for_chatbot for chatbot_id: {chatbot_id}")
+    
+    total = 0
+    documents_query = (
+            select(ChatbotDocument)
+            .filter(ChatbotDocument.chatbot_id == chatbot_id)
+        )
+    documents_result = await db_session.execute(documents_query)
+    documents_data = documents_result.scalars().all()
+    
+    print(f"[DEBUG] Found {len(documents_data)} total documents for chatbot_id: {chatbot_id}")
+    
+    url_count = 0
+    for doc in documents_data:
+        print(f"[DEBUG] Document ID: {doc.id}, content_type: '{doc.content_type}', consumed_webscrap_quota_kb: {doc.consumed_webscrap_quota_kb}")
+        if doc.content_type == "url":
+            url_count += 1
+            if doc.consumed_webscrap_quota_kb is not None:
+                total += doc.consumed_webscrap_quota_kb
+                print(f"[DEBUG] Added {doc.consumed_webscrap_quota_kb} to total (new total: {total})")
+            else:
+                print(f"[DEBUG] Skipped None value for URL document")
+    
+    print(f"[DEBUG] Found {url_count} URL documents, total consumed quota: {total}")
+    return total
+
 def get_base_url(url: str) -> str:
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc.lower()}"
@@ -1805,13 +1914,13 @@ async def update_organization_chatbot_files(
             raise HTTPException(status_code=404, detail="Chatbot not found")
         
         #check on total number of links
-        if website_added:
-            for website_link in website_added:
-                from app.utils.user_helpers import extract_domain_urls
-                if website_link.sweep_domain:
-                    total_links = extract_domain_urls(website_link.website_link)
-                    if len(total_links) > 200:
-                        raise HTTPException(status_code=400, detail=f"Your domain has more than 200 links.")
+        # if website_added:
+        #     for website_link in website_added:
+        #         from app.utils.user_helpers import extract_domain_urls
+        #         if website_link.sweep_domain:
+        #             total_links = extract_domain_urls(website_link.website_link)
+        #             if len(total_links) > 200:
+        #                 raise HTTPException(status_code=400, detail=f"Your domain has more than 200 links.")
         # Remove documents
         if document_removed:
             for document in document_removed: 
@@ -1851,14 +1960,7 @@ async def update_organization_chatbot_files(
                 
                 # content = await document_file.read()
                 try:
-                    # Upload file to S3
-                    # s3_client.put_object(
-                    #     Bucket=envs.BUCKET_NAME,  # Ensure the environment variable is set
-                    #     Key=document_s3_key,
-                    #     Body=content,
-                    #     ContentType=document_file.content_type
-                    # )
-                    # print(f"File uploaded to S3: {document_s3_key}")
+                 
 
                     file_extension = os.path.splitext(document_file)[1][1:]
                     # Save file metadata to DB
@@ -1901,13 +2003,14 @@ async def update_organization_chatbot_files(
                     )
                     print('lambda called in side link deltee')
         
-        
         urls = []
         # website added
         if website_added:
-            total_doc = await get_total_documents_for_chatbot(db, chatbot.id)
-            if total_doc + len(website_added) > envs.TOTAL_NO_OF_ALLOWED_URLS:
-                raise HTTPException(status_code=422, detail=f"Maximum allowed website limit are 50.")
+            # total_doc = await get_total_documents_for_chatbot(db, chatbot.id)
+            used_quota = await get_total_consumed_webscrap_quota_for_chatbot(db, chatbot.id)
+            print(f'used quota: {used_quota}')
+            if used_quota > 10000: #10MB
+                raise HTTPException(status_code=443, detail=f"Maximum allowed website limit are 10MB.")
             for website_link in website_added:
                 if website_link.website_url_id:
                     webscrap_entery = await get_webscrap_entery(id=website_link.website_url_id, chatbot_id = chatbot.id, session = db)
@@ -2004,13 +2107,17 @@ async def update_organization_chatbot_files(
                         MessageDeduplicationId=str(uuid.uuid4())
                     )
                     print(f"Sent to SQS: {response['MessageId']} inside update create new link scrapping and single page.")
+        file_size = await get_total_chatbot_filesize(db, organization_id, chatbot_id)
+        webscrap_size = await get_total_chatbot_webscrap_size(db, organization_id, chatbot_id, current_user)
         
         return ChatbotFileUpdateResponse(
             website_url = urls,
-            bot_documents = bot_documents
+            bot_documents = bot_documents,
+            consumed_webscrap_size = webscrap_size,
+            consumed_file_size = file_size
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unable to submit QA. Please try later.")
+        raise HTTPException(status_code=500, detail=f"Unable to submit process your request please try again later.")
 
 async def update_organization_chatbot_traning_QAs(
         db: AsyncSession, 
@@ -2655,7 +2762,7 @@ async def get_bubble_settings_customization(
         #     detail="No bubble customizations found"
         # )
         from app.schemas.request.chatbot_config import BubbleCutomize
-        response =  BubbleCutomize(bubble_bgColor = "#F9F9F9", bubble_icon = "https://marti-file-upload-bucket.s3.us-east-2.amazonaws.com/logo/marti-logo-nobg.png")
+        response =  BubbleCutomize(bubble_bgColor = "#F9F9F9", bubble_icon = "https://marti-frontend.s3.us-east-2.amazonaws.com/marti-logo-nobg.png")
         return response
     return chatbot_customize
 
@@ -3357,12 +3464,11 @@ async def add_user_to_organization_service(
     """Add a user to an organization (Admin/Super Admin only)"""
     if current_user.role not in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
         raise HTTPException(status_code=403, detail="Not authorized")
+    
     return await add_organization_user(db, organization_id, user_data)
 
 
     
-
-
 
 
 

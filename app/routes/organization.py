@@ -20,6 +20,7 @@ from app.services.organization import (
     list_chatbot_docs,
     list_chatbot_urls,
     get_total_chatbot_filesize,
+    get_file_and_webscrap_sizes_for_chatbot,
     super_admin_list_organization_users_service,
     update_organization_profile_data,
     list_platform_pre_existing_agents,
@@ -28,6 +29,8 @@ from app.services.organization import (
     create_organization_chatbot_service,
     update_organization_chatbot_traning_QAs,
     list_organization_chatbots_service,
+    fech_allowed_usage_per_admin,
+    update_bot_streaming,
     get_organization_chatbot_service,
     update_organization_chatbot_files,
     check_if_file_exist,
@@ -51,6 +54,7 @@ from app.services.organization import (
     get_qa_templates_service,
     get_chatbot_settings_customization,
     get_public_chatbot_settings_customization,
+    get_total_chatbot_webscrap_size,
     get_bubble_settings_customization,
     create_organization_chatbot_memory,
     update_organization_chatbot_memory,
@@ -70,78 +74,16 @@ from app.services.user import (
 from fastapi import Query
 from app.services.auth import get_current_user, check_roles
 from app.models.user import User, UserRole
+from app.models.chatbot_model import BotType
 from typing import List
 from app.schemas.request.chatbot_config import CreateData, QATemplateData, BotDetails, UpdateChatbotConfigRequest, ChatbotDetails, QAsRemove, GuardrailsAdded, GuardrailsRemoved, GuardrailsUpdated, ChatbotCutomize, BubbleCutomize
-from app.schemas.response.chatbot_config import ChatbotFileUpdateResponse, UrlValidationResponse, WebsiteUrlPagination, DocumentPagination,ChatbotConfigResponse, WebsiteUrl, AllChatbotResponse,ChatBotCreation, WebscrapUrl, DocumentInfo, ImageGenerationLlmModelEnum,LlmModelEnum, AppModels, BotLlmRequest,UrlValidationRequest, WebsiteRemoved, DetailsRequest, ChatbotPrompt, DocumentRemoved, UpdateQATemplateData, ChatbotMemory, GetChatbotMemoryResponse,ChatbotMemoryResponse, ChatbotSuggestion,ChatbotSuggestionUpdate, ChatbotSuggestionResponse
+from app.schemas.response.chatbot_config import ChatbotFileUpdateResponse, UrlValidationResponse, WebsiteUrlPagination, DocumentPagination,ChatbotConfigResponse, WebsiteUrl,AllPreExistingChatbotResponse, AllChatbotResponse,ListBots,ChatBotCreation, WebscrapUrl, DocumentInfo, ImageGenerationLlmModelEnum,LlmModelEnum, AppModels, BotLlmRequest,UrlValidationRequest, WebsiteRemoved, DetailsRequest, ChatbotPrompt, DocumentRemoved, UpdateQATemplateData, ChatbotMemory, GetChatbotMemoryResponse,ChatbotMemoryResponse, ChatbotSuggestion,ChatbotSuggestionUpdate, ChatbotSuggestionResponse
 from app.schemas.response import chatbot_config
 from app.common.env_config import get_envs_setting
 
 envs = get_envs_setting()
 router = APIRouter()
 ###########################################SuperAdmin routes####################################
-#super admin route
-
-# @router.get("/view/{organization_id}", response_model=List[OrganizationResponse])
-# async def read_organization(
-#     organization_id: int,
-#     skip: int = 0, 
-#     limit: int = 5,
-#     db: AsyncSession = Depends(get_async_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     return await list_organization_users_service(db, organization_id, current_user, skip, limit)
-#     #return await read_organization_service(db, organization_id, current_user)
-
-# #super admin route
-# @router.post("/create-user", response_model=OrganizationResponse, status_code=status.HTTP_201_CREATED)
-# async def create_new_organization(
-#     user_data: SuperAdminCreateUser,
-#     db: AsyncSession = Depends(get_async_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     update_data = user_data.dict(exclude={"organization_id"})
-#     user_create_data = UserCreate(**update_data)
-#     return await create_organization_user_service(db, user_data.organization_id, user_create_data, current_user)
-
-#suer admin route
-# @router.patch("/update-user", response_model=OrganizationResponse)
-# async def update_existing_organization(
-#     organization_data: SuperAdminUpdateUser,
-#     db: AsyncSession = Depends(get_async_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     update_data = organization_data.dict(exclude={"organization_id", "user_id"})
-#     user_data_extract = OrganizationUserUpdate(**update_data)
-#     return await update_organization_user_status_service(
-#         db, organization_data.organization_id, organization_data.user_id, user_data_extract, current_user
-#     )
-
-#super admin route
-# @router.delete("/delete-user/{organization_id}/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-# async def delete_existing_organization(
-#     organization_id: int,
-#     user_id: int,
-#     db: AsyncSession = Depends(get_async_db),
-#     current_user: User = Depends(get_current_user)
-# ):
-#     await remove_user_from_organization_service(db, organization_id, user_id, current_user)
-#     return JSONResponse(
-#         status_code=status.HTTP_200_OK,
-#         content={"message": "User successfully removed from the organization"}
-#     ) 
-#     # await delete_existing_organization_service(db, organization_id, current_user)
-
-#Super admin route
-# @router.patch("/toggle-active/{organization_id}/{user_id}")
-# async def toggle_user_active_status(
-#     user_id: int,
-#     organization_id: int,
-#     db: AsyncSession = Depends(get_async_db),
-#     current_user: User = Depends(get_current_user)
-# ) -> UserResponse:
-#     user = await toggle_user_active_status_service(organization_id, user_id, current_user, db)
-#     return UserResponse.model_validate(user)
-
 # Super admin route
 @router.get("/list", response_model=AllSuperAdminOrganizations)
 async def list_all_organizations(
@@ -324,6 +266,12 @@ async def create_organization_chatbot(
         # if len(document_files) > envs.TOTAL_NO_OF_ALLOWED_DOCS:
         #     raise HTTPException(status_code=422, detail=f"Maximum allowed document file limit are 5.")
         
+        # Validate scaffolding level for student chatbots
+        if chatbot_details.bot_type == BotType.student and chatbot_details.scaffolding_level is None:
+            raise HTTPException(status_code=422, detail="Scaffolding level is required for student type chatbots.")
+        if chatbot_details.bot_type != BotType.student and chatbot_details.scaffolding_level is not None:
+            raise HTTPException(status_code=422, detail="Scaffolding level should not be provided.")
+        
         # if guardrails:
         #     guardrails_list = json.loads(guardrails)
         #     if not isinstance(guardrails_list, list):
@@ -358,6 +306,7 @@ async def create_organization_chatbot(
         "llm_model_name": chatbot_details.llm_model_name,
         "llm_prompt": chatbot_details.llm_prompt,
         "chatbot_name": chatbot_details.chatbot_name,
+        "scaffolding_level": chatbot_details.scaffolding_level,
     }
     converted_data = CreateData(**chatbot_data)
     chatbot = await create_organization_chatbot_service(
@@ -385,11 +334,36 @@ async def create_organization_chatbot(
     
     return response_data
 
+
+@router.get("/{organization_id}/list/pre-existing", response_model= AllPreExistingChatbotResponse)
+async def list_organization_chatbots(
+    organization_id: int,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user)
+):
+    """List all chatbots for an organization"""
+    # chatbots =  await list_organization_chatbots_service(db, organization_id, current_user, cateogry_indicator)
+    
+    response = []
+    organization_data = await get_organization(db = db, org_id = organization_id)
+    
+    chatbots =  await list_platform_pre_existing_agents(current_user)
+    for chatbot in chatbots:
+            response.append(ChatBotCreation(
+            chatbot_type=chatbot["chatbot_type"],
+            chatbot_name=chatbot["chatbot_name"],
+            avatar = chatbot["avatar_url"] if chatbot["avatar_url"] else "",
+            specilized_type=chatbot["specilized_type"]
+            # llm_model_name=chatbot["llm_model_name"]
+        ))
+    
+    return AllPreExistingChatbotResponse(org_avatar = organization_data.logo, chatbots = response)
+
+
 @router.get("/{organization_id}/list/chatbots", response_model= AllChatbotResponse) # AllChatbotResponse
 async def list_organization_chatbots(
     organization_id: int,
     cateogry_indicator:int,
-    pre_existing: bool= False,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -398,38 +372,41 @@ async def list_organization_chatbots(
     
     response = []
     organization_data = await get_organization(db = db, org_id = organization_id)
-    if pre_existing:
-        chatbots =  await list_platform_pre_existing_agents(current_user)
-        for chatbot in chatbots:
-                response.append(ChatBotCreation(
-                chatbot_type=chatbot["chatbot_type"],
-                chatbot_name=chatbot["chatbot_name"],
-                avatar = chatbot["avatar_url"] if chatbot["avatar_url"] else "",
-                # llm_model_name=chatbot["llm_model_name"]
-            ))
-    else:
-        chatbots =  await list_organization_chatbots_service(db, organization_id, current_user, cateogry_indicator)
-        for chatbot in chatbots:
-                response.append(ChatBotCreation(
-                id=chatbot.id,
-                chatbot_type=chatbot.chatbot_type,
-                chatbot_name=chatbot.chatbot_name,
-                avatar = chatbot.avatar_url if chatbot.avatar_url else "",
-                specilized_type = chatbot.specialized_type
-                # llm_model_name=chatbot.llm_model_name
-            ))
+    chatbots =  await list_organization_chatbots_service(db, organization_id, current_user, cateogry_indicator)
+    
+    for chatbot in chatbots:
+            from app.utils.database_helper import check_and_refresh_chat_cycle
+            is_expire = await check_and_refresh_chat_cycle(current_user, chatbot, session=db)
+            
+            allowed_messages = 0
+            # if chatbot.chatbot_type == "External":
+            allowed_messages = await fech_allowed_usage_per_admin(chatbot, session=db)
+            response.append(ListBots(
+            id=chatbot.id,
+            chatbot_type=chatbot.chatbot_type,
+            chatbot_name=chatbot.chatbot_name,
+            avatar = chatbot.avatar_url if chatbot.avatar_url else "",
+            specilized_type = chatbot.specialized_type,
+            used_messages= 0 if is_expire else chatbot.monthly_messages_count // 2 if chatbot.monthly_messages_count else 0,
+            allowed_messages=allowed_messages // 2
+            # llm_model_name=chatbot.llm_model_name
+        ))
                 
-    # for chatbot in chatbots:
-    #         response.append(ChatBotCreation(
-    #         id=chatbot.id,
-    #         chatbot_type=chatbot.chatbot_type,
-    #         chatbot_name=chatbot.chatbot_name,
-    #         avatar = chatbot.avatar_url if chatbot.avatar_url else "",
-    #         # llm_model_name=chatbot.llm_model_name
-    #     ))
     return AllChatbotResponse(org_avatar = organization_data.logo, chatbots = response)
 
-from app.schemas.response import chatbot_config # QATemplateData
+
+@router.patch("/{organization_id}/streaming/chatbots/{chatbot_id}")
+async def update_chatbot_streaming(
+    organization_id: int,
+    chatbot_id: int,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get a specific chatbot"""
+    return await update_bot_streaming(db, organization_id, chatbot_id, current_user)
+
+
+
 @router.get("/{organization_id}/get/chatbot/{chatbot_id}", response_model=ChatbotConfigResponse)
 async def get_organization_chatbot(
     organization_id: int,
@@ -478,7 +455,8 @@ async def update_organization_chatbot_detials(
         detials_request.chatbot_name,
         detials_request.chatbot_role,
         current_user,
-        detials_request.avatar
+        detials_request.avatar,
+        detials_request.scaffolding_level
     )
     await insert_logs(organization_id, f"The configuration or settings of a chatbot instance have been updated.", f'{current_user.name}', "Chatbot", db)
     return JSONResponse(
@@ -511,14 +489,14 @@ async def update_organization_chatbot_text(
         content={"message": "Chatbot has been updated successfully."}
     ) 
 
-@router.get("/{organization_id}/chatbot/{chatbot_id}/files-size")
-async def chatbot_files_size(
-    organization_id: int,
-    chatbot_id: int,
+
+@router.get("/files-webscrap-sizes")
+async def chatbot_webscrap_and_file_sizes(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user)
 ):
-    return await get_total_chatbot_filesize(db, organization_id, chatbot_id, current_user)
+    return await get_file_and_webscrap_sizes_for_chatbot()
+
 
 @router.get("/{organization_id}/chatbot/{chatbot_id}/url-knowledge-base", response_model=WebsiteUrlPagination)
 async def list_organization_users(
@@ -580,37 +558,8 @@ async def update_organization_chatbot_files_route(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(get_current_user) 
 ):
-    # try:
-        # Parse document_removed
-        # parsed_document_removed = (
-        #     [DocumentRemoved(**item) for item in json.loads(document_removed)]
-        #     if document_removed else []
-        # )
-
-        # # Parse website_added
-        # parsed_website_added = (
-        #     [WebsiteUrl(**item) for item in json.loads(website_added)]
-        #     if website_added else []
-        # )
-
-        # # Parse website_removed
-        # parsed_website_removed = (
-        #     [WebsiteRemoved(**item) for item in json.loads(website_removed)]
-        #     if website_removed else []
-        # )
-
-    # except json.JSONDecodeError as e:
-    #     raise HTTPException(
-    #         status_code=400,
-    #         detail=f"Invalid JSON format: {str(e)}"
-    #     )
-    # except ValidationError as e:
-    #     raise HTTPException(
-    #         status_code=400,
-    #         detail=f"Validation error: {str(e)}"
-    #     )
-        
-    chatbot_update =  await update_organization_chatbot_files(
+    try:
+        chatbot_update =  await update_organization_chatbot_files(
         db, 
         organization_id,
         chatbot_id,
@@ -619,10 +568,23 @@ async def update_organization_chatbot_files_route(
         website_added,
         website_removed,
         current_user
-    )
-    await insert_logs(organization_id, f"The configuration or settings of a chatbot instance have been updated.", f'{current_user.name}', "Chatbot", db)
+        )
+        await insert_logs(organization_id, f"The configuration or settings of a chatbot instance have been updated.", f'{current_user.name}', "Chatbot", db)
+        
+        return chatbot_update
+
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON format: {str(e)}"
+        )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Validation error: {str(e)}"
+        )
+        
     
-    return chatbot_update
 
 @router.patch("/{organization_id}/update/chatbot/{chatbot_id}/QAs",  response_model=List[chatbot_config.QATemplateData])
 async def update_organization_chatbot_qa(
@@ -689,49 +651,6 @@ async def remove_chatbot_from_organization(
         content={"message": "Chatbot has deleted successfully from the organization."}
     ) 
 
-# @router.patch("/{organization_id}/update/chatbot/{chatbot_id}", response_model=ChatBotCreation)
-# async def update_organization_chatbot(
-#     organization_id: int,
-#     chatbot_id: int,
-#     llm_prompt: str = Form(...),
-#     qa_templates: Optional[str] = Form(None),
-#     guardrails: Optional[List[str]] = Form(None),  
-#     website_links:Optional[str] = Form(None),
-#     document_files: Optional[List[UploadFile]] = File(None),
-#     db: AsyncSession = Depends(get_async_db),
-#     current_user: User = Depends(get_current_user)  # Changed from admin-only to any user
-# ):
-#     """Update a chatbot"""
-#     try:
-#         # Parse JSON strings
-#         parsed_qa_templates = json.loads(qa_templates) if qa_templates else []
-#         parsed_website_links = [WebsiteUrl(**link) for link in json.loads(website_links)] if website_links else []
-#         # parsed_guardrails = json.loads(guardrails) if guardrails else []
-#     except json.JSONDecodeError as e:
-#         raise HTTPException(status_code=422, detail=f"Invalid JSON format: {e}")
-#     # Assemble chatbot_data manually
-#     chatbot_data = {
-#         "organization_id": organization_id,
-#         "chatbot_id": chatbot_id,
-#         "qa_templates": parsed_qa_templates,
-#         "llm_prompt": llm_prompt,
-#         "guardrails": guardrails,
-#     }
-#     converted_data = UpdateChatbotConfigRequest(**chatbot_data)
-#     chatbot_update =  await update_organization_chatbot_service(
-#         db, 
-#         converted_data,
-#         current_user,
-#         parsed_website_links, 
-#         document_files
-#     )
-# # Eagerly load relationships and serialize response
-#     response_data = ChatBotCreation(
-#         id=chatbot_update.id,
-#         chatbot_type=chatbot_update.chatbot_type,
-#         chatbot_name=chatbot_update.chatbot_name,
-#     )
-#     return response_data
 
 @router.post("/{organization_id}/setting/customize/chatbot/{chatbot_id}", response_model=ChatbotCutomize)
 async def cutomize_organization_chatbot(
@@ -808,17 +727,11 @@ async def cutomize_organization_chatbot(
     )
     return bubble_setting_customize
 
-from fastapi import Response
-
 @router.get("/get/setting/customize/public/bubble/{chatbot_id}", response_model=BubbleCutomize)
 async def cutomize_organization_chatbot(
     chatbot_id: str,
-    response: Response,
     db: AsyncSession = Depends(get_async_db),
 ):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
-    response.headers["Access-Control-Allow-Headers"] = "*"
     bubble_setting_customize =  await get_bubble_settings_customization(
         db, 
         chatbot_id,

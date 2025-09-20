@@ -1,5 +1,6 @@
 from pinecone.grpc import PineconeGRPC as Pinecone
 from pinecone import ServerlessSpec
+from pinecone import Pinecone, Index
 # from app.common.env_config import get_envs_setting
 # settings = get_envs_setting()
 
@@ -23,4 +24,20 @@ def custom_create_index(index_name: str, vector_diamention:int,api_key):
         print(f"index: {index_name}, already exist.")
         return None  
     
+
+
+def clean_pinecone_index(index_name: str, api_key: str):
+    pc = Pinecone(api_key=api_key)          
+    index = pc.Index(index_name)         
+    # 1. discover every namespace
+    stats = index.describe_index_stats()
+    for ns in stats.namespaces:
+        print(f"Deleting namespace: {ns!r}")
+        index.delete(delete_all=True, namespace=ns)
+
+    print("All namespaces and records removed.")
+
+
 # custom_create_index("marti-ai",3072, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+
+# clean_pinecone_index("marti-ai","pcsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")

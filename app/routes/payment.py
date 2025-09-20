@@ -9,9 +9,11 @@ from sqlalchemy.orm import Session
 from app.services import payment
 from fastapi import BackgroundTasks
 from app.models.user import Plan
-from app.services.payment import adjust_tier_degration_change
+from app.services.payment import adjust_tier_degration_change, get_usage_for_plan
 from app.schemas.request.payment import SubscriptionRequest, UpdateSubscriptionRequest, ValidatePromoCodeRequest, UpdateCardRequest
 from app.utils.db_helpers import insert_logs
+from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime
 logger = logging.getLogger(__name__)
 envs = get_envs_setting()
 
@@ -25,7 +27,6 @@ payments_router_protected = APIRouter(
     # dependencies=[Depends(oauth2_scheme), Depends(validate_access_token),]
 )
 
-from sqlalchemy.ext.asyncio import AsyncSession
  
 def get_price_amount(price):
     """Extract price amount based on pricing model"""
@@ -58,8 +59,8 @@ async def get_prices(session: Session = Depends(get_async_db), current_user: Use
             product = price.product
             metadata = product.get("metadata", {})
             is_addon = product.get("metadata", {}).get("type") == "addon"
-            if product.get("metadata", {}).get("type") == "metered_user":
-                print(f'price data fo a plan == {price}')
+            # if product.get("metadata", {}).get("type") == "metered_user":
+            #     print(f'price data fo a plan == {price}')
             interval = price.recurring.get("interval") if price.recurring else None
             print(f'interval = {interval}')
  
@@ -107,24 +108,7 @@ async def get_prices(session: Session = Depends(get_async_db), current_user: Use
             previous_base_plan_id = None
             is_yearly = False
             is_monthly = False
-            # if not subs:
-            #     subs = await stripe.Subscription.list_async(
-            #         customer=current_user.stripeId,
-            #         status="canceled",
-            #         limit=1,
-            #         expand=["data.items"]
-            #     )
-            #     if subs.data:
-            #         print(f'subs.data = {subs.data}')
-            #         canceled_sub = subs.data[0]
-            #         for item in canceled_sub["items"]["data"]:
-            #             price = item["price"]
-            #             base_plan = is_base_plan(price["id"])
-            #             if base_plan:  
-            #                 previous_base_plan_id = price["id"]
-            #             else:
-            #                 previous_addon_plan_id = price["id"]
-
+            
 
             if subs.data:
                 sub = subs.data[0]
@@ -178,10 +162,11 @@ async def get_prices(session: Session = Depends(get_async_db), current_user: Use
                 "is_monthly": is_monthly
             }
         ]
-
+        usage_for_plan = await get_usage_for_plan(session, current_user.organization_id, current_user)
         return {
-            "plans": filtered_plans,
             "user_plans": user_plans,
+            "plan_usage": usage_for_plan,
+            "plans": filtered_plans,
             "addons": add_on_price_ids
         }
     except StripeError as e:
@@ -200,13 +185,16 @@ async def create_subscription(
 
         if not user.stripeId:
             raise HTTPException(status_code=400, detail="Stripe ID not found")
-        promo_codes = await stripe.PromotionCode.list_async(
-            code=request.coupon,
-            active=True,
-            limit=1,
-        )
-        if not promo_codes.data or not promo_codes.data[0].coupon:
-            raise HTTPException(status_code=404, detail="Promo code is invalid.")
+        promo_codes = None
+        if request.coupon:
+            promo_codes = await stripe.PromotionCode.list_async(
+                code=request.coupon,
+                active=True,
+                limit=1,
+            )
+            if not promo_codes.data or not promo_codes.data[0].coupon:
+                raise HTTPException(status_code=404, detail="Promo code is invalid.")
+
         invoices = await stripe.Invoice.list_async(
                 customer=user.stripeId,
                 limit=100  # adjust as needed
@@ -223,11 +211,12 @@ async def create_subscription(
             discount = invoice.get("discount")
             if discount:
                 invoice_coupon = discount.get("coupon")
-                if invoice_coupon and invoice_coupon["id"] == promo_codes.data[0].coupon.id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="This coupon has already been used by the customer."
-                    )
+                if invoice_coupon and promo_codes:
+                    if invoice_coupon["id"] == promo_codes.data[0].coupon.id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="This coupon has already been used by the customer."
+                        )
         # Step 2: Check for non-addon base plans
         for sub in existing_subs.data:
             for item in sub["items"]["data"]:
@@ -401,8 +390,11 @@ async def update_subscription(request: UpdateSubscriptionRequest, user: User = D
     # try:
         if not user.stripeId:
             raise HTTPException(status_code=400, detail="Stripe ID not found")
-        if request.priceId == envs.STRIPE_ENTERPRISE_PRICE_ID:
-            raise HTTPException(status_code=400, detail="Unauthautherize operation")
+
+        # Enterprise plan validation - check requested total seats
+        if request.priceId in [envs.STRIPE_ENTERPRISE_PRICE_ID_YEARLY, envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY] and request.no_of_users_apart_from_admin < 100:
+            raise HTTPException(status_code=400, detail="You must have at least 100 users to subscribe to enterprise plan.")
+
         # Enforce base plan presence
         if not request.priceId:
             raise HTTPException(status_code=400, detail="A base plan is required.")
@@ -461,15 +453,12 @@ async def update_subscription(request: UpdateSubscriptionRequest, user: User = D
         if current_base_plan_item and current_base_plan_item.price.recurring.get("interval") == "year":
             # Get the new plan's interval
             new_plan_price = await stripe.Price.retrieve_async(request.priceId)
-            if new_plan_price.recurring and new_plan_price.recurring.get("interval") == "month":
+            if new_plan_price.recurring and new_plan_price.recurring.get("interval") == "month" and current_base_plan_item.price.get("product") == new_plan_price.get("product"):
                 raise HTTPException(
                     status_code=400, 
                     detail="Cannot downgrade from yearly to monthly plan. Please cancel your current subscription and wait for it to expire before subscribing to a monthly plan."
                 )
-            # raise HTTPException(
-            #     status_code=400, 
-            #     detail="Cannot downgrade from yearly to monthly plan. Please cancel your current subscription and wait for it to expire before subscribing to a monthly plan."
-            # )
+            
         # If still empty, raise error
         if not current_subscription:
             raise HTTPException(status_code=404, detail="No valid subscription found to update.")
@@ -484,7 +473,7 @@ async def update_subscription(request: UpdateSubscriptionRequest, user: User = D
             if user.current_plan == Plan.starter:
                 previous_base_price = envs.STRIPE_STARTER_PRICE_ID 
             elif user.current_plan == Plan.enterprise:
-                previous_base_price = envs.STRIPE_ENTERPRISE_PRICE_ID 
+                previous_base_price = envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY 
             if not previous_base_price:
                 raise HTTPException(status_code=400, detail="Please create your plan first then you can update")
             
@@ -644,8 +633,8 @@ async def update_subscription(request: UpdateSubscriptionRequest, user: User = D
         updated_subscription = stripe.Subscription.modify(
             subscription_id,
             items=deduplicated_items,
-            proration_behavior="create_prorations",
-            billing_cycle_anchor="now",
+            proration_behavior="always_invoice",
+            # billing_cycle_anchor="now",
             payment_behavior="allow_incomplete",
             discounts=[{"coupon": promo_codes.data[0].coupon}] if request.coupon else None,
             default_payment_method=default_payment_method,
@@ -679,286 +668,530 @@ async def is_yearly_plan(price_id):
         return False
     
     
+# @payments_router_protected.post("/preview-invoice")
+# async def preview_invoice(
+#     data: UpdateSubscriptionRequest,
+#     user: User = Depends(get_current_user)
+# ):
+#     try:
+#         from app.services.payment import get_current_user_seats
+#         enterprise_ids = [envs.STRIPE_ENTERPRISE_PRICE_ID_YEARLY, envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY] 
+#         total_users_paid = await get_current_user_seats(stripe_customer_id = user.stripeId)
+#         if data.priceId in enterprise_ids and (total_users_paid + data.no_of_users_apart_from_admin) < 100:
+#             raise HTTPException(status_code=400, detail="You must have at least 100 users to subscribe to enterprise plan.")
+
+#         if user.current_plan == Plan.enterprise and data.priceId not in enterprise_ids:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="You can not directly downgrade from enterprise plan to starter plan. Please cancel your subscription and wait for the billed duration to finish."
+#             )
+        
+#         # Fetch the promo code from Stripe
+#         if data.coupon:
+#             promo_codes = await stripe.PromotionCode.list_async(
+#                 code=data.coupon,
+#                 active=True,
+#                 limit=1,
+#             )
+
+#             if not promo_codes.data or not promo_codes.data[0].coupon:
+#                 raise HTTPException(status_code=404, detail="Promo code is invalid.")
+
+#         ADD_ON_PRICE_MAP = {"image_generation":envs.STRIPE_IMAGE_GENERATION_PRICE_ID}
+#         print(f'one')
+#         if not user.stripeId:
+#             raise HTTPException(status_code=400, detail="User has no Stripe ID.")
+#         subscriptions = await stripe.Subscription.list_async(
+#             customer=user.stripeId,
+#             # status="active", # default to active
+#             limit=1,
+#             expand=["data.items"]
+#         )
+
+#         if not subscriptions:
+#             subscriptions = await stripe.Subscription.list_async(
+#                 customer=user.stripeId,
+#                 status="canceled",
+#                 limit=1,
+#                 expand=["data.items"]
+#             )
+#             if not subscriptions:
+#                 raise HTTPException(status_code=404, detail="No valid subscription found to update.")
+            
+#             if subscriptions.data[0].status == "canceled":
+#                 user_susbcription_items = [
+#                         {"price": data.priceId}
+#                     ] + [
+#                         {"price": price_id}
+#                         for key, enabled in data.add_on.items()
+#                         if enabled and (price_id := ADD_ON_PRICE_MAP.get(key))
+#                     ]
+#                 selected_price_ids = {item.get('price') for item in user_susbcription_items if 'price' in item}
+#                 if (
+#                     envs.STRIPE_STARTER_PRICE_ID in selected_price_ids and
+#                     envs.STRIPE_IMAGE_GENERATION_PRICE_ID in selected_price_ids
+#                 ):
+#                     raise HTTPException(status_code=404, detail="You are not allowed to subscribe to image generation addon with starter plan.")
+#                 seen = set()
+#                 filtered_items = []
+#                 for item in user_susbcription_items:
+#                     key = item.get("id") or item.get("price")
+#                     if key and key not in seen:
+#                         filtered_items.append(item)
+#                         seen.add(key)
+
+#                 user_susbcription_items = filtered_items
+#                 invoice =  stripe.Invoice.create_preview(
+#                 customer=user.stripeId,
+#                 subscription_details={
+#                     "items": user_susbcription_items,
+#                     "proration_behavior": "none",
+#                 },
+#                 discounts=[{"coupon": promo_codes.data[0].coupon}] if data.coupon else None,
+
+#                 preview_mode="next"  # or "recurring" depending on your use case
+#                 )
+#                 line_items = []
+#                 proration_total = 0
+#                 for line in invoice.lines.data:
+#                     line_items.append({
+#                         "description": line.description,
+#                         "amount": line.amount / 100,  # Convert cents to dollars
+#                         "period": {
+#                             "start": line.period.start,
+#                             "end": line.period.end
+#                         },
+#                         "proration": True #there will no proration as we technically creating new invoie.
+#                     })
+#                     proration_total += line.amount
+#                 return {
+#                         "success": True,
+#                         "invoice": {
+#                             "total": proration_total / 100,
+#                             "subtotal": proration_total / 100,
+#                             "due_now": proration_total / 100,
+#                             "next_billing_date": invoice.next_payment_attempt,
+#                             "line_items": line_items
+#                         }
+#                     }
+        
+#         # Get current subscription - using async version to be consistent
+#         subscription = await stripe.Subscription.retrieve_async(
+#             subscriptions.data[0].id,
+#             expand=["items"]
+#         )
+
+#         current_base_plan_item = next(
+#             (item for item in subscription['items']['data'] 
+#              if is_base_plan(item.price.id)), 
+#             None
+#         )
+        
+#         if current_base_plan_item and current_base_plan_item.price.recurring.get("interval") == "year":
+#             # Get the new plan's interval
+#             new_plan_price = await stripe.Price.retrieve_async(data.priceId)
+#             print(f'current and new plan product ids: {current_base_plan_item.price.get("product")} - {new_plan_price.get("product")}')
+#             if new_plan_price.recurring and new_plan_price.recurring.get("interval") == "month" and current_base_plan_item.price.get("product") == new_plan_price.get("product"):
+#                 raise HTTPException(
+#                     status_code=400, 
+#                     detail="Cannot downgrade from yearly to monthly plan. Please cancel your current subscription and wait for it to expire before subscribing to a monthly plan."
+#                 )
+            
+        
+#         # Map current subscription items
+#         current_items = {item.price.id: item.id for item in subscription['items']['data']}
+#         # Prepare items for update preview
+#         items = []
+#         print(f'three current_items = {current_items}')
+       
+#         # Add base plan
+#         if data.priceId in current_items:
+#             # Update existing item
+#             items.append({"id": current_items[data.priceId]})
+#         else:
+#             # If changing base plan, remove old one and add new one
+#             base_item_id = next((item.id for item in subscription['items']['data']
+#                                if is_base_plan(item.price.id)), None)
+#             if base_item_id:
+#                 items.append({"id": base_item_id, "deleted": True})
+#             items.append({"price": data.priceId})
+#         print(f'fial =four == {items}')
+        
+#         # Create a reverse map of enabled add-on price IDs
+#         selected_addon_price_ids = {
+#             price_id
+#             for key, enabled in data.add_on.items()
+#             if enabled and (price_id := ADD_ON_PRICE_MAP.get(key))
+#         }
+
+#         # Remove existing add-ons that are no longer selected
+#         for price_id, item_id in current_items.items():
+#             if is_base_plan(price_id):
+#                 continue
+#             if price_id not in selected_addon_price_ids:
+#                 items.append({"id": item_id, "deleted": True})
+#         # Add new add-ons that aren't already in the subscription
+#         for addon_price_id in selected_addon_price_ids:
+#             if addon_price_id not in current_items:
+#                 items.append({"price": addon_price_id})
+
+         
+#         selected_price_ids = {item.get('price') for item in items if 'price' in item}
+#         if (
+#             envs.STRIPE_STARTER_PRICE_ID in selected_price_ids and
+#             envs.STRIPE_IMAGE_GENERATION_PRICE_ID in selected_price_ids
+#         ):
+#             raise HTTPException(status_code=404, detail="You are not allowed to subscribe to image generation addon with starter plan.")
+#         if data.no_of_users_apart_from_admin is not None and data.user_usage_priceId:
+#                 # 1. delete any existing user-item
+                
+#                 for item in subscription["items"]["data"]:
+#                     print(f'items price ids == {item.price.id}')
+#                     if not is_base_plan(item.price.id):
+#                             print(f'usage userage plan deltion occure')
+#                             items.append({"id": item.id, "deleted": True})
+                            
+                
+#                 # 2. insert the yearly (or monthly) user price
+#                 print(f'quantity == {data.no_of_users_apart_from_admin}')
+#                 items.append({
+#                     "price": data.user_usage_priceId,
+#                     "quantity": max(0, data.no_of_users_apart_from_admin)
+#                 })
+           
+#         print(f'final before pervie == {items}')
+#         # remove duplicates while keeping the first occurrence
+#         seen = set()
+#         filtered_items = []
+#         for item in items:
+#             key = item.get("id") or item.get("price")
+#             if key and key not in seen:
+#                 filtered_items.append(item)
+#                 seen.add(key)
+
+#         items = filtered_items
+#         print(f'after removing uplicates == {items}')
+#         preview_invoice = stripe.Invoice.upcoming(
+#             customer=user.stripeId,
+#             subscription=subscription.id,
+#             subscription_details={
+#                     "items": items,
+#                     "proration_behavior": "create_prorations",
+                  
+#                 }
+#             )
+#         # invoice_with_preview =  stripe.Invoice.create_preview(
+#         #         customer=user.stripeId,
+#         #         subscription = subscription.id,
+#         #         subscription_details={
+#         #             "items": items,
+#         #             "proration_behavior": "create_prorations",
+#         #             "billing_cycle_anchor":"now"
+#         #         },
+#         #         discounts=[{"coupon": promo_codes.data[0].coupon}] if data.coupon else None,
+
+#         #         preview_mode="next"  # or "recurring" depending on your use case
+#         #         )
+        
+#         # Format the response
+#         line_items = []
+#         # proration_total = 0   
+#         for line in preview_invoice.lines.data:
+#             if line.proration:
+#                 line_items.append({
+#                     "description": line.description,
+#                     "amount": line.amount / 100,  # Convert cents to dollars
+#                     "period": {
+#                         "start": line.period.start,
+#                         "end": line.period.end
+#                     },
+#                     "proration": True
+#                 }) 
+#                 # proration_total += line.amount
+#         # print(f'final reust = {invoice.total / 100}')
+#         # print(f'due now {invoice.amount_due / 100}')
+#         print(f'final invoice reust = {preview_invoice.total / 100}')
+#         print(f'due invoice now {preview_invoice.amount_due / 100}')
+        
+#         return {
+#             "success": True,
+#             "invoice": {
+#                 "total": preview_invoice.amount_due / 100,
+#                 "subtotal": preview_invoice.amount_due / 100,
+#                 "due_now": preview_invoice.amount_due / 100,
+#                 "next_billing_date": preview_invoice.next_payment_attempt,
+#                 "line_items": line_items
+#             }
+#         }
+#     except Exception as e:
+#         print(f"Error in preview_invoice: {str(e)}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+from app.services.payment import get_current_user_seats
+
+# It's good practice to have helper functions for clarity
+def is_base_plan(price_id: str) -> bool:
+    base_plan_ids = [
+        envs.STRIPE_STARTER_PRICE_ID,
+        envs.STRIPE_ENTERPRISE_PRICE_ID_YEARLY,
+        envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY
+    ]
+    return price_id in base_plan_ids
+
+def is_seat_plan(price_id: str) -> bool:
+    seat_plan_ids = [
+        envs.STRIPE_ENTERPRISE_USER_PRICE_ID_YEARLY,
+        envs.STRIPE_ENTERPRISE_USER_PRICE_ID_MONTHLY
+    ]
+    return price_id in seat_plan_ids
+ 
 @payments_router_protected.post("/preview-invoice")
 async def preview_invoice(
     data: UpdateSubscriptionRequest,
     user: User = Depends(get_current_user)
 ):
     try:
-        from app.services.payment import get_current_user_seats
-
-        total_users_paid = await get_current_user_seats(stripe_customer_id = user.stripeId)
-        if data.priceId in [envs.STRIPE_ENTERPRISE_PRICE_ID_YEARLY, envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY] and (total_users_paid + data.no_of_users_apart_from_admin) < 100:
-            raise HTTPException(status_code=400, detail="You must have at least 100 users to subscribe to enterprise plan.")
-
-        # Fetch the promo code from Stripe
-        if data.coupon:
-            promo_codes = await stripe.PromotionCode.list_async(
-                code=data.coupon,
-                active=True,
-                limit=1,
-            )
-
-            if not promo_codes.data or not promo_codes.data[0].coupon:
-                raise HTTPException(status_code=404, detail="Promo code is invalid.")
-
-        ADD_ON_PRICE_MAP = {"image_generation":envs.STRIPE_IMAGE_GENERATION_PRICE_ID}
-        print(f'one')
+        logger.info(f"Preview invoice request started for user {user.id} (stripe_id: {user.stripeId})")
+        logger.info(f"Request: priceId={data.priceId}, users={data.no_of_users_apart_from_admin}, add_on={data.add_on}, coupon={data.coupon}")
+        
         if not user.stripeId:
             raise HTTPException(status_code=400, detail="User has no Stripe ID.")
-        subscriptions = await stripe.Subscription.list_async(
-            customer=user.stripeId,
-            # status="active", # default to active
-            limit=1,
-            expand=["data.items"]
-        )
 
-        if not subscriptions:
-            subscriptions = await stripe.Subscription.list_async(
-                customer=user.stripeId,
-                status="canceled",
-                limit=1,
-                expand=["data.items"]
+        # --- Initial Validations ---
+        enterprise_ids = [envs.STRIPE_ENTERPRISE_PRICE_ID_YEARLY, envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY]
+        if data.priceId in enterprise_ids:
+            # Enterprise plan requires minimum 100 total seats
+            if data.no_of_users_apart_from_admin < 100:
+                logger.warning(f"Enterprise plan validation failed: requested seats ({data.no_of_users_apart_from_admin}) < 100 for user {user.id}")
+                raise HTTPException(status_code=400, detail="You must have at least 100 users for the enterprise plan.")
+
+        if user.current_plan == Plan.enterprise and not is_base_plan(data.priceId):
+             raise HTTPException(
+                status_code=400,
+                detail="You cannot directly downgrade from an enterprise plan to a starter plan. Please cancel your subscription."
             )
-            if not subscriptions:
-                raise HTTPException(status_code=404, detail="No valid subscription found to update.")
-            
-            if subscriptions.data[0].status == "canceled":
-                user_susbcription_items = [
-                        {"price": data.priceId}
-                    ] + [
-                        {"price": price_id}
-                        for key, enabled in data.add_on.items()
-                        if enabled and (price_id := ADD_ON_PRICE_MAP.get(key))
-                    ]
-                selected_price_ids = {item.get('price') for item in user_susbcription_items if 'price' in item}
-                if (
-                    envs.STRIPE_STARTER_PRICE_ID in selected_price_ids and
-                    envs.STRIPE_IMAGE_GENERATION_PRICE_ID in selected_price_ids
-                ):
-                    raise HTTPException(status_code=404, detail="You are not allowed to subscribe to image generation addon with starter plan.")
-                seen = set()
-                filtered_items = []
-                for item in user_susbcription_items:
-                    key = item.get("id") or item.get("price")
-                    if key and key not in seen:
-                        filtered_items.append(item)
-                        seen.add(key)
 
-                user_susbcription_items = filtered_items
-                invoice =  stripe.Invoice.create_preview(
-                customer=user.stripeId,
-                subscription_details={
-                    "items": user_susbcription_items,
-                    "proration_behavior": "none",
-                },
-                discounts=[{"coupon": promo_codes.data[0].coupon}] if data.coupon else None,
+        promo_code_id = None
+        if data.coupon:
+            logger.info(f"Validating promo code '{data.coupon}' for user {user.id}")
+            promo_codes = await stripe.PromotionCode.list_async(code=data.coupon, active=True, limit=1)
+            if not promo_codes.data:
+                raise HTTPException(status_code=404, detail="Promo code is invalid.")
+            promo_code_id = promo_codes.data[0].id
+            logger.info(f"Valid promo code applied for user {user.id}")
 
-                preview_mode="next"  # or "recurring" depending on your use case
+        # --- Fetch Active or Recently Canceled Subscription ---
+        subscriptions = await stripe.Subscription.list_async(
+                    customer=user.stripeId,
+                    status="all",
+                    limit=1,
+                    expand=["data.items"]
                 )
-                line_items = []
-                proration_total = 0
-                for line in invoice.lines.data:
-                    line_items.append({
-                        "description": line.description,
-                        "amount": line.amount / 100,  # Convert cents to dollars
-                        "period": {
-                            "start": line.period.start,
-                            "end": line.period.end
-                        },
-                        "proration": True #there will no proration as we technically creating new invoie.
-                    })
-                    proration_total += line.amount
-                return {
-                        "success": True,
-                        "invoice": {
-                            "total": proration_total / 100,
-                            "subtotal": proration_total / 100,
-                            "due_now": proration_total / 100,
-                            "next_billing_date": invoice.next_payment_attempt,
-                            "line_items": line_items
-                        }
-                    }
-        if not subscriptions:
-            raise HTTPException(status_code=404, detail="No valid subscription found to update.")
         
-        # Get current subscription - using async version to be consistent
-        subscription = await stripe.Subscription.retrieve_async(
-            subscriptions.data[0].id,
-            expand=["items"]
-        )
+        active_subscription = next((s for s in subscriptions.data if s.status in ['active', 'trialing', 'past_due']), None)
         
-        # print(f'response subscription =  {subscription}')
-        # Check for yearly to monthly downgrade prevention
-        # Check for yearly to monthly downgrade prevention
-        current_base_plan_item = next(
-            (item for item in subscription['items']['data'] 
-             if is_base_plan(item.price.id)), 
-            None
-        )
-        if current_base_plan_item and current_base_plan_item.price.recurring.get("interval") == "year":
-            # Get the new plan's interval
-            new_plan_price = await stripe.Price.retrieve_async(data.priceId)
-            if new_plan_price.recurring and new_plan_price.recurring.get("interval") == "month":
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Cannot downgrade from yearly to monthly plan. Please cancel your current subscription and wait for it to expire before subscribing to a monthly plan."
-                )
-            # raise HTTPException(
-            #     status_code=400, 
-            #     detail="Cannot downgrade from yearly to monthly plan. Please cancel your current subscription and wait for it to expire before subscribing to a monthly plan."
-            # )
-        
-        # Map current subscription items
-        current_items = {item.price.id: item.id for item in subscription['items']['data']}
-        # Prepare items for update preview
-        items = []
-        print(f'three current_items = {current_items}')
-       
-        # Add base plan
-        if data.priceId in current_items:
-            # Update existing item
-            items.append({"id": current_items[data.priceId]})
+        if active_subscription:
+            logger.info(f"Found active subscription {active_subscription.id} for user {user.id}")
         else:
-            # If changing base plan, remove old one and add new one
-            base_item_id = next((item.id for item in subscription['items']['data']
-                               if is_base_plan(item.price.id)), None)
-            if base_item_id:
-                items.append({"id": base_item_id, "deleted": True})
-            items.append({"price": data.priceId})
-        print(f'fial =four == {items}')
+            logger.info(f"No active subscription found for user {user.id}")
         
-        # Create a reverse map of enabled add-on price IDs
-        selected_addon_price_ids = {
-            price_id
-            for key, enabled in data.add_on.items()
-            if enabled and (price_id := ADD_ON_PRICE_MAP.get(key))
-        }
-
-        # Remove existing add-ons that are no longer selected
-        for price_id, item_id in current_items.items():
-            if is_base_plan(price_id):
-                continue
-            if price_id not in selected_addon_price_ids:
-                items.append({"id": item_id, "deleted": True})
-        # Add new add-ons that aren't already in the subscription
-        for addon_price_id in selected_addon_price_ids:
-            if addon_price_id not in current_items:
-                items.append({"price": addon_price_id})
-
-         
-        selected_price_ids = {item.get('price') for item in items if 'price' in item}
-        if (
-            envs.STRIPE_STARTER_PRICE_ID in selected_price_ids and
-            envs.STRIPE_IMAGE_GENERATION_PRICE_ID in selected_price_ids
-        ):
-            raise HTTPException(status_code=404, detail="You are not allowed to subscribe to image generation addon with starter plan.")
-        if data.no_of_users_apart_from_admin is not None and data.user_usage_priceId:
-                # 1. delete any existing user-item
-                
-                for item in subscription["items"]["data"]:
-                    print(f'items price ids == {item.price.id}')
-                    if not is_base_plan(item.price.id):
-                            print(f'usage userage plan deltion occure')
-                            items.append({"id": item.id, "deleted": True})
-                            
-                
-                # 2. insert the yearly (or monthly) user price
-                print(f'quantity == {data.no_of_users_apart_from_admin}')
+        # ======================================================================
+        #  Scenario 1: User has NO active subscription (New or Reactivating)
+        # ======================================================================
+        if not active_subscription or active_subscription.status == 'canceled':
+            logger.info(f"Creating new subscription preview for user {user.id}")
+            items = [{"price": data.priceId}]
+            
+            # Add seat plan if enterprise
+            if data.user_usage_priceId:
+                logger.info(f"Adding {data.no_of_users_apart_from_admin} user seats to new subscription for user {user.id}")
                 items.append({
                     "price": data.user_usage_priceId,
-                    "quantity": max(0, data.no_of_users_apart_from_admin)
+                    "quantity": data.no_of_users_apart_from_admin
                 })
-                # # 1. Remove the *any* existing user-item (monthly or yearly)
-                # user_item = next(
-                #     (item for item in subscription["items"]["data"]
-                #     if not is_base_plan(item.price.id)),   # all non-base items
-                #     None
-                # )
-                # if user_item:
-                #     items.append({"id": user_item.id, "deleted": True})
-                # # 2. Add the new yearly (or monthly) user price
-                # items.append({
-                #     "price": data.user_usage_priceId,
-                #     "quantity": max(0, data.no_of_users_apart_from_admin)
-                # })
+            
+            # Add-ons logic
+            ADD_ON_PRICE_MAP = {"image_generation": envs.STRIPE_IMAGE_GENERATION_PRICE_ID}
+            enabled_addons = []
+            for key, enabled in data.add_on.items():
+                if enabled and (price_id := ADD_ON_PRICE_MAP.get(key)):
+                    items.append({"price": price_id})
+                    enabled_addons.append(key)
+            
+            if enabled_addons:
+                logger.info(f"Adding add-ons {enabled_addons} to new subscription for user {user.id}")
+            
+            # Business rule validation
+            selected_price_ids = {item['price'] for item in items}
+            if envs.STRIPE_STARTER_PRICE_ID in selected_price_ids and envs.STRIPE_IMAGE_GENERATION_PRICE_ID in selected_price_ids:
+                raise HTTPException(status_code=400, detail="Image generation add-on is not available for the starter plan.")
 
-                # if existing_usage_item:
-                #     # Update quantity on existing item
-                #     items.append({
-                #         "id": existing_usage_item.id,
-                #         "quantity": data.no_of_users_apart_from_admin
-                #     })
-                # else:
-                #     # Price not in subscription yet → add it
-                #     items.append({
-                #         "price": data.user_usage_priceId,
-                #         "quantity": data.no_of_users_apart_from_admin
-                #     })
-
-        # # total_paid_this_cycle_cents = await calculate_current_cycle_paid(user.stripeId)
-        # print(f'subscription printed 0 == {subscription}')
-         
-        print(f'final before pervie == {items}')
-        # remove duplicates while keeping the first occurrence
-        seen = set()
-        filtered_items = []
-        for item in items:
-            key = item.get("id") or item.get("price")
-            if key and key not in seen:
-                filtered_items.append(item)
-                seen.add(key)
-
-        items = filtered_items
-        print(f'after removing uplicates == {items}')
-        invoice_with_preview =  stripe.Invoice.create_preview(
+            # Create invoice preview for new subscription
+            preview_invoice = await stripe.Invoice.upcoming_async(
                 customer=user.stripeId,
-                subscription = subscription.id,
-                subscription_details={
-                    "items": items,
-                    "proration_behavior": "create_prorations",
-                    "billing_cycle_anchor":"now"
-                },
-                discounts=[{"coupon": promo_codes.data[0].coupon}] if data.coupon else None,
+                subscription_details={"items": items},
+                discounts=[{"promotion_code": promo_code_id}] if promo_code_id else None,
+            )
 
-                preview_mode="next"  # or "recurring" depending on your use case
-                )
+        # ======================================================================
+        #  Scenario 2: User HAS an active subscription (Upgrade/Downgrade)
+        # ======================================================================
+        else:
+            logger.info(f"Updating existing subscription {active_subscription.id} for user {user.id}")
+            subscription = active_subscription
+            
+            # Get subscription items using dictionary access
+            items_data = subscription['items']['data']
+            
+            items_for_update = []
+            current_base_item = next((item for item in items_data if is_base_plan(item['price']['id'])), None)
+            current_seat_item = next((item for item in items_data if is_seat_plan(item['price']['id'])), None)
+
+            # 1. Handle Base Plan Change
+            if current_base_item and current_base_item['price']['id'] != data.priceId:
+                logger.info(f"Changing base plan from {current_base_item['price']['id']} to {data.priceId} for user {user.id}")
+                items_for_update.append({"id": current_base_item['id'], "price": data.priceId})
+            elif current_base_item and current_base_item['price']['id'] == data.priceId:
+                logger.info(f"Base plan unchanged ({data.priceId}) for user {user.id}")
+            
+            # 2. Handle User Seat Change (Enterprise Plan)
+            if data.user_usage_priceId:
+                quantity = data.no_of_users_apart_from_admin
+                if current_seat_item:
+                    # Check if either quantity OR price is changing
+                    quantity_changed = current_seat_item['quantity'] != quantity
+                    price_changed = current_seat_item['price']['id'] != data.user_usage_priceId
+                    
+                    if quantity_changed or price_changed:
+                        # Always specify both price and quantity when updating
+                        update_item = {
+                            "id": current_seat_item['id'],
+                            "price": data.user_usage_priceId,
+                            "quantity": quantity
+                        }
+                        
+                        if price_changed:
+                            logger.info(f"Updating seat price from {current_seat_item['price']['id']} to {data.user_usage_priceId} for user {user.id}")
+                        
+                        if quantity_changed:
+                            logger.info(f"Updating seat quantity from {current_seat_item['quantity']} to {quantity} for user {user.id}")
+                        
+                        items_for_update.append(update_item)
+                    else:
+                        logger.info(f"Seat quantity ({quantity}) and price ({data.user_usage_priceId}) unchanged for user {user.id}")
+                else:
+                    # Add new seat item (e.g., upgrading from starter)
+                    logger.info(f"Adding {quantity} user seats to subscription for user {user.id}")
+                    items_for_update.append({"price": data.user_usage_priceId, "quantity": quantity})
+            elif current_seat_item:
+                # Remove seat item (e.g., downgrading to starter)
+                logger.info(f"Removing user seats from subscription for user {user.id}")
+                items_for_update.append({"id": current_seat_item['id'], "deleted": True})
+
+            # 3. Handle Add-ons
+            ADD_ON_PRICE_MAP = {"image_generation": envs.STRIPE_IMAGE_GENERATION_PRICE_ID}
+            
+            current_addon_ids = {item['price']['id'] for item in items_data if item['price']['id'] in ADD_ON_PRICE_MAP.values()}
+            requested_addon_ids = {price_id for key, enabled in data.add_on.items() if enabled and (price_id := ADD_ON_PRICE_MAP.get(key))}
+
+            # Add new add-ons
+            new_addons = requested_addon_ids - current_addon_ids
+            if new_addons:
+                logger.info(f"Adding add-ons {list(new_addons)} to subscription for user {user.id}")
+                for price_id in new_addons:
+                    items_for_update.append({"price": price_id})
+            
+            # Remove old add-ons
+            removed_addons = current_addon_ids - requested_addon_ids
+            if removed_addons:
+                logger.info(f"Removing add-ons {list(removed_addons)} from subscription for user {user.id}")
+                for item in items_data:
+                    if item['price']['id'] in removed_addons:
+                        items_for_update.append({"id": item['id'], "deleted": True})
+
+            # Check if there are any changes to process
+            if not items_for_update and not promo_code_id:
+                logger.info(f"No subscription changes detected for user {user.id} - returning zero amount")
+                # Return zero-amount preview since nothing is changing
+                return {
+                    "success": True,
+                    "invoice": {
+                        "total": 0.0,
+                        "subtotal": 0.0,
+                        "due_now": 0.0,
+                        "next_billing_date": None,
+                        "line_items": []
+                    }
+                }
+            elif not items_for_update and promo_code_id:
+                logger.info(f"Only promo code changes detected for user {user.id} - processing discount preview")
+            
+            # Create invoice preview for subscription update
+            logger.info(f"Processing {len(items_for_update)} subscription item changes for user {user.id}")
+            for i, item in enumerate(items_for_update):
+                change_type = "Unknown"
+                if item.get('price'):
+                    change_type = "Price change"
+                elif item.get('quantity'):
+                    change_type = "Quantity change"
+                elif item.get('deleted'):
+                    change_type = "Deletion"
+                logger.info(f"  Change {i+1} ({change_type}): {item}")
+            
+            # Use create_preview for immediate subscription changes (recommended approach)
+            preview_params = {
+                "customer": user.stripeId,
+                "subscription": subscription.id,
+                "subscription_details": {
+                    "items": items_for_update,
+                    "proration_behavior": "always_invoice"  # Immediate charge for upgrades
+                }
+            }
+            
+            if promo_code_id:
+                preview_params["discounts"] = [{"promotion_code": promo_code_id}]
+            
+            logger.info(f"Creating invoice preview with parameters: {preview_params}")
+            preview_invoice = await stripe.Invoice.create_preview_async(**preview_params)
+
+        # --- Trust Stripe's Calculations Completely ---
+        amount_due = preview_invoice.amount_due / 100
         
-        # Format the response
-        line_items = []
-        # proration_total = 0   
-        for line in invoice_with_preview.lines.data:
-            if line.proration:
-                line_items.append({
-                    "description": line.description,
-                    "amount": line.amount / 100,  # Convert cents to dollars
-                    "period": {
-                        "start": line.period.start,
-                        "end": line.period.end
-                    },
-                    "proration": True
-                }) 
-                # proration_total += line.amount
-        # print(f'final reust = {invoice.total / 100}')
-        # print(f'due now {invoice.amount_due / 100}')
-        print(f'final invoice reust = {invoice_with_preview.total / 100}')
-        print(f'due invoice now {invoice_with_preview.amount_due / 100}')
+        logger.info(f"Stripe invoice preview for user {user.id}:")
+        logger.info(f"  Total: ${preview_invoice.total / 100}")
+        logger.info(f"  Subtotal: ${preview_invoice.subtotal / 100}")  
+        logger.info(f"  Amount due: ${amount_due}")
+        logger.info(f"  Line items: {len(preview_invoice.lines.data)}")
         
+        # Format line items for response
+        line_items = [
+            {
+                "description": line.description,
+                "amount": line.amount / 100,
+                "period": {"start": line.period.start, "end": line.period.end},
+                "proration": line.proration
+            }
+            for line in preview_invoice.lines.data
+        ]
+        logger.info("########################################################")
+        logger.info(f"Detailed line items: {line_items}")
+        logger.info("########################################################")
+        logger.info(f"Preview invoice completed for user {user.id} - Amount due: ${amount_due}")
+
         return {
             "success": True,
             "invoice": {
-                "total": invoice_with_preview.amount_due / 100,
-                "subtotal": invoice_with_preview.amount_due / 100,
-                "due_now": invoice_with_preview.amount_due / 100,
-                "next_billing_date": invoice_with_preview.next_payment_attempt,
+                "total": amount_due,
+                "subtotal": preview_invoice.subtotal / 100,
+                "due_now": amount_due,
+                "next_billing_date": preview_invoice.next_payment_attempt,
                 "line_items": line_items
             }
         }
     except Exception as e:
-        print(f"Error in preview_invoice: {str(e)}")
+        logger.error(f"Error in preview_invoice for user {user.id if 'user' in locals() else 'unknown'}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
-
 @payments_router_protected.get("/create-payment-session")
 async def create_payment_session(priceId: str, user: User = Depends(get_current_user)):
     print('Stripe ID', user.stripeId)
@@ -1017,7 +1250,7 @@ async def cancel_subscription(
             if user.current_plan == Plan.starter:
                 previous_base_price = envs.STRIPE_STARTER_PRICE_ID 
             elif user.current_plan == Plan.enterprise:
-                previous_base_price = envs.STRIPE_ENTERPRISE_PRICE_ID 
+                previous_base_price = envs.STRIPE_ENTERPRISE_PRICE_ID_MONTHLY 
             if not previous_base_price:
                 raise HTTPException(status_code=400, detail="You dont have any active subscription to cancel")
         
@@ -1126,7 +1359,6 @@ async def cancel_subscription(
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @payments_router_protected.post("/resume-subscription")
 async def resume_subscription(user: User = Depends(get_current_user), db = Depends(get_async_db)):

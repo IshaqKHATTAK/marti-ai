@@ -47,7 +47,7 @@ class User(Base):
         default=UserRole.USER.value
     )
     
-    #Status
+    # Status
     is_active = Column(Boolean, default=True)
     is_paid = Column(Boolean, default=False)
     is_onboarded = Column(Boolean, default=False)
@@ -67,6 +67,9 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), default=get_utc_now)
     updated_at = Column(DateTime(timezone=True), default=get_utc_now, onupdate=get_utc_now)
 
+    billing_cycle_start = Column(DateTime(timezone=True), nullable=True, default=get_utc_now)
+    billing_cycle_end = Column(DateTime(timezone=True), nullable=True, default=get_utc_now)
+    
     # Add this relationship
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
 
@@ -79,6 +82,7 @@ class User(Base):
     country = Column(String, nullable=True)
     stripeId = Column(String(200), nullable=True)
     is_user_consent_given = Column(Boolean, default=False, nullable=True)
+
     def get_context_string(self, context: str):
         return f"{context}{self.hashed_password[-6:]}{self.updated_at.strftime('%m%d%Y%H%M%S')}".strip()
     

@@ -214,3 +214,101 @@ Clearly indicate when information is drawn from specific contexts to enhance tra
     'image_url':'Generated image URL if it exists, otherwise null'
 }}}}
 '''
+
+topic_relevance_check_prompt = '''You are a topic relevance analyzer. Your task is to determine if a user's current question is related to the existing conversation topic or if they have switched to a completely different subject.
+
+### Analysis Criteria:
+- **Topic Continuity**: Is the current question building upon or related to previous conversation topics?
+- **Subject Matter**: Are we still discussing the same academic subject, concept, or domain?
+- **Contextual Flow**: Does the question naturally follow from the conversation history?
+
+### Examples of Topic Changes:
+- **Same Topic**: "Can you explain more about photosynthesis?" → "What factors affect photosynthesis?"
+- **Topic Change**: "Tell me about photosynthesis" → "How do I solve quadratic equations?"
+
+### Output Format:
+You must respond with ONLY a JSON object containing a boolean field:
+
+{{"is_topic_related": true/false}}
+
+- **true**: The question is related to the current conversation topic
+- **false**: The user has switched to a completely different topic/subject
+
+### Instructions:
+- Analyze the user's current question against the conversation history
+- Consider the main subject matter, not just individual words
+- Be strict about topic changes - only mark as related if there's clear continuity
+- Return ONLY the JSON response, no additional text or explanation
+
+Remember: Your response must be ONLY the JSON object with the boolean value.'''
+
+# Scaffolding-based question generation prompts
+scaffolding_question_generation_prompt = '''
+You are an educational question generator that creates questions based on different scaffolding levels.
+
+### Scaffolding Levels:
+- **high**: Lots of support (step-by-step instructions, modeling, close monitoring) - Generate 8-12 detailed, guided questions
+- **medium**: Partial support (guiding questions, hints, feedback) - Generate 5-8 moderate complexity questions  
+- **low**: Little support (independent practice, applying knowledge) - Generate 3-5 challenging, open-ended questions
+
+### Instructions:
+1. Generate questions appropriate for the given scaffolding level and topic
+2. Questions should explore different concepts and aspects of the topic
+3. For high scaffolding: Include step-by-step guidance, hints, and structured approaches
+4. For medium scaffolding: Include some guidance but allow for independent thinking
+5. For low scaffolding: Create open-ended questions that require synthesis and application
+
+### Topic: {topic}
+### Material Context: {material}
+### Scaffolding Level: {scaffolding_level}
+
+### Output Format:
+Return a JSON array of question objects:
+[
+    {{"question": "Your question here", "hints": ["hint1", "hint2"], "difficulty": "easy/medium/hard"}}
+  ...
+]
+
+Generate questions that progressively explore the topic in depth based on the scaffolding level.
+'''
+
+# Answer validation prompt
+answer_validation_prompt = '''You are an educational answer validator that checks if a student's answer matches one of the expected questions.
+
+### Your Tasks:
+1. Determine which question (if any) the student's answer addresses
+2. Evaluate if the answer is correct, partially correct, or incorrect
+3. Return the appropriate response
+
+### Questions List:
+{questions}
+
+### Student Answer:
+{student_answer}
+
+### Output Format:
+Return JSON:
+{{
+  "question_index": number or null,
+  "is_correct": true/false/null,
+  "feedback": "brief feedback or explanation"
+}}
+
+If the answer doesn't match any question, return question_index: null and is_correct: null.
+If the answer is wrong, return is_correct: false.
+If the answer is correct or partially correct, return is_correct: true.'''
+
+# Scaffolding-based response generation
+scaffolding_response_prompt = '''You are an educational assistant that provides responses based on scaffolding levels.
+
+### Scaffolding Level: {scaffolding_level}
+### Context: {context}
+### Student Answer: {student_answer}
+### Question Answered: {question}
+
+### Response Guidelines:
+- **high scaffolding**: Provide detailed explanations, step-by-step guidance, lots of encouragement
+- **medium scaffolding**: Provide moderate guidance with some hints and feedback
+- **low scaffolding**: Provide minimal guidance, encourage independent thinking
+
+Generate an appropriate educational response based on the scaffolding level.'''

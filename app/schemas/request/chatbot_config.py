@@ -22,8 +22,13 @@ class QATemplateData(BaseModel):
 
 class BotType(str, Enum):
     internal = "internal"
-    teacher = "teacher"
+    student = "student"
     external = "external"
+
+class ScaffoldingLevel(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
 
 class BotDetails(BaseModel):
     chatbot_name: str
@@ -31,10 +36,10 @@ class BotDetails(BaseModel):
     llm_role: str
     llm_streaming: Optional[bool] = True
     llm_model_name: Optional[str] = 'gpt-4o-mini'  
-    avatar: Optional[str] = '' 
+    avatar: Optional[str] = ''
     llm_temperature: Optional[float] = 0.2
     bot_type: BotType = BotType.internal
-
+    scaffolding_level: Optional[ScaffoldingLevel] = None
 
 class CreateData(BaseModel):
     llm_temperature: Optional[float] = 0.2
@@ -45,6 +50,7 @@ class CreateData(BaseModel):
     llm_model_name: Optional[str] = "gpt-4o-mini"
     llm_prompt: str
     chatbot_name: str
+    scaffolding_level: Optional[ScaffoldingLevel] = None
 
 class UpdateChatbotConfigRequest(BaseModel):
     organization_id: int

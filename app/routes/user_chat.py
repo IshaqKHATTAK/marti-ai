@@ -41,18 +41,6 @@ feedback_router = APIRouter(
 )
 
 
-# @chats_routes.get("/external/get-shared-bot/{chatbot_id}", status_code=status.HTTP_200_OK)
-# async def get_shared_bot_url(
-#     chatbot_id: int,
-#     current_user: User = Depends(get_current_user),
-#     session: Session = Depends(database_config.get_async_db)
-# ):
-#     return await user_chat.get_shared_bot_url_service(
-#         session, 
-#         chatbot_id, 
-#         current_user.organization_id, 
-#         current_user
-#     )
 
 @chats_routes.get("/external/get-shared-option/{chatbot_id}", status_code=status.HTTP_200_OK, response_model=ShareChatbotResponse)
 async def get_share_iframe(
@@ -90,9 +78,14 @@ async def send_message(data: UserSecureChat, backgound_task:BackgroundTasks, ses
     await app_limiter.init_redis()
     await app_limiter.check_chat_limits()
 
+
     bot_answer, thread_id =  await user_chat.chat_with_external_bot(data, session, background_tasks=backgound_task)
     
-    return ExternalChatbotResponse(id=thread_id, answer=bot_answer['message'])
+    return ExternalChatbotResponse(
+        id=thread_id, 
+        answer=bot_answer['message']
+    )
+
 
 @chats_routes.post("/external/s3-public-session-url", status_code=status.HTTP_200_OK, response_model=PublicS3Response)
 async def generate_s3_presigned_url(request: S3PublicUpload):
@@ -106,6 +99,7 @@ async def generate_s3_presigned_url(request: S3PublicUpload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @chats_routes.post("/s3-session-url", status_code=status.HTTP_200_OK, response_model=S3Response)
 async def generate_s3_presigned_url(
             request: S3UploadRequest, 
@@ -118,6 +112,10 @@ async def generate_s3_presigned_url(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+from fastapi.responses import StreamingResponse
+import json
+
+
 @chats_routes.post("/internal/send-message", status_code=status.HTTP_200_OK, response_model=ChatbotResponse)
 async def update_admin_config(
                             data: UserChat, backgound_task:BackgroundTasks, 
@@ -127,11 +125,58 @@ async def update_admin_config(
     print(f'start execuction')
     if not data.question:
         raise HTTPException(status_code=400, detail="Enter a question")
-    print('send api start execution')
+    bot_config = await user_chat.get_chatbot_config_by_id(int(data.bot_id), session)
     
-    bot_answer, url_to_image, thread_id, image_generation_flag, created_at, updated_at, message_id, new_chat =  await user_chat.chat_with_bot(data, session, current_user, background_tasks=backgound_task)
-     
-    return ChatbotResponse(id=thread_id, answer=bot_answer['message'] if not image_generation_flag else '', url_to_image = url_to_image, image_generation_flag=image_generation_flag, created_at=created_at, updated_at=updated_at, message_id = message_id, new_chat = new_chat)
+    # --- STREAMING MODE ---
+    if bot_config.llm_streaming:
+        async def generate_sse_response():
+            """Generate SSE formatted response with proper error handling"""
+            try:
+                # Stream pre-formatted events from service
+                async for chunk in user_chat.stream_chat_with_bot(
+                    data.bot_id, data, session, current_user.id
+                ):
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                # Completion signal
+                yield f"data: {json.dumps({'type': 'done', 'message': 'Stream completed'})}\n\n"
+            except HTTPException as e:
+                yield f"data: {json.dumps({'error': e.detail, 'type': 'error', 'status_code': e.status_code})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': f'Unexpected error: {str(e)}', 'type': 'error'})}\n\n"
+            finally:
+                yield f"data: {json.dumps({'type': 'close'})}\n\n"
+
+        return StreamingResponse(
+            generate_sse_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Connection": "keep-alive",
+                "Content-Encoding": "identity",
+                "Transfer-Encoding": "chunked",
+                "X-Accel-Buffering": "no",
+                "X-Proxy-Buffering": "off",
+                "X-Content-Type-Options": "nosniff",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            }
+        )
+    else:
+        print('send api start execution')
+        
+        bot_answer, url_to_image, thread_id, image_generation_flag, created_at, updated_at, message_id, new_chat =  await user_chat.chat_with_bot(data, session, current_user, background_tasks=backgound_task)
+        
+        return ChatbotResponse(
+            id=thread_id, 
+            answer=bot_answer['message'] if not image_generation_flag else '', 
+            url_to_image = url_to_image, 
+            image_generation_flag=image_generation_flag, 
+            created_at=created_at, 
+            updated_at=updated_at, 
+            message_id = message_id, 
+            is_simplify = data.is_simplify,
+            new_chat = new_chat
+            )
 
 @chats_routes.post("/internal/get-messages", status_code=status.HTTP_200_OK, response_model=GetMessagesResponseInternal)
 async def update_admin_config(
@@ -198,7 +243,6 @@ async def search_thread(
     response_sessions = AllSessionsResponse(sessions=sessions, total_session=total_sessions)
     return response_sessions
 
-
 @chats_routes.delete('/delete-session/{thread_id}',status_code = status.HTTP_200_OK)
 async def delete_thread(
                         thread_id: int, 
@@ -258,16 +302,6 @@ async def feedback_content_creation(
         current_user,
         session, 
     )
-    # response = MessageFeedbackResponse(
-    #     bot_id = created_announcement.chatbot_id,
-    #     user_name = created_announcement.user_name,
-    #     message_id = created_announcement.message_id,
-    #     feedback = created_announcement.feedback,
-    #     chatbot_type = created_announcement.chatbot_type,
-    #     status = created_announcement.status,
-    #     feedback_id = created_announcement.id
-    # )
-    # retun teh created chatbot emeory in format creator, text
     return response
 
 @feedback_router.get("/",  response_model=AllMessageFeedbackResponse)
@@ -305,29 +339,6 @@ async def get_all_feedbacks(
     return AllMessageFeedbackResponse(feedbacks = feedbacks, total_feedback = total_feedback)
 
 
-# @feedback_router.patch("/",  response_model=MessageFeedbackResponse)
-# async def update_feedback_content(
-#     feedback_request: MessageFeedbackRequest,
-#     current_user: User = Depends(get_current_user),
-#     session: Session = Depends(database_config.get_async_db),
-# ):
-    
-#     created_announcement =  await create_message_feedback(
-#         feedback_request,
-#         current_user,
-#         session, 
-#     )
-#     response = MessageFeedbackResponse(
-#         bot_id = created_announcement.chatbot_id,
-#         user_name = created_announcement.user_name,
-#         message_id = created_announcement.message_id,
-#         feedback = created_announcement.feedback,
-#         chatbot_type = created_announcement.chatbot_type,
-#         status = created_announcement.status,
-#         feedback_id = created_announcement.id
-#     )
-#     # retun teh created chatbot emeory in format creator, text
-#     return response
 
 from fastapi import Body
 @feedback_router.delete("/", status_code = status.HTTP_200_OK)
@@ -416,5 +427,4 @@ async def analytics(
     formatted_results = await user_chat.get_all_org_messages_count(user=current_user, db=session, chatbot_ids=filters_data.chatbot_ids)
     
     return formatted_results
-
 

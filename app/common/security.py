@@ -257,13 +257,7 @@ class SecurityManager:
         raw_token = user.get_context_string(context=envs.VERIFICATION_TOKEN_SECRET)
         encoded_token = base64.urlsafe_b64encode(raw_token.encode()).decode()
         return encoded_token
-        # expiration = datetime.utcnow() + timedelta(hours=24)
-        # data = {
-        #     "email": email,
-        #     "exp": expiration
-        # }
-        # return jwt.encode(data, envs.VERIFICATION_TOKEN_SECRET, algorithm=envs.ALGORITHM)
-    
+       
     @classmethod
     def verify_token(cls, plan_token: str,hashed_token: str):
         """Verify email verification token and return email"""

@@ -163,6 +163,7 @@ async def delete_faqs(
     )
     return {"message": "Record deleted successfully"}
 
+
 @landing_router.get("/all",  response_model=list[LandingGetResponse])
 async def all_landing_content_getting(
     db: AsyncSession = Depends(get_async_db),

@@ -56,13 +56,15 @@ class ChatbotResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     message_id: str
+    is_simplify: Optional[bool] = False
     new_chat: bool
-
+    
+  
 class ExternalChatbotResponse(BaseModel):
     id: str
     answer: Optional[str] = None
     # image_generation_flag: bool
-
+   
 
 class Chats(BaseModel):
     role: str

@@ -1,5 +1,7 @@
+from sqlalchemy.exc import SQLAlchemyError
 
-
+from app.common.database_config import AsyncSessionLocal
+import backoff
 from app.models.organization import  Organization
 from app.models.chatbot_model import ChatbotDocument, UrlSweep, ChatbotConfig, Threads
 from sqlalchemy.future import select
@@ -15,11 +17,16 @@ from app.common.database_config import get_async_db
 from typing import List
 import json
 from collections import defaultdict
-
+from app.common.env_config import get_envs_setting
+envs = get_envs_setting()
 scheduler = AsyncIOScheduler()
 # async def get_file_from_user_db(Organization_id, filename, session):
 #     result = await session.execute(select(ChatbotConfig).filter(ChatbotConfig.id == data.id)) 
 #     return result.scalars().first()
+
+
+import logging
+logger = logging.getLogger(__name__)
 
 async def format_user_chatbot_permissions(db, organization_id, group_ids):
     merged_groups = defaultdict(dict)
@@ -299,6 +306,8 @@ async def increment_chatbot_message_count(chatbot_id, session):
     )
     chatbot = result.scalars().first()
 
+    print("increment_chatbot_message_count")
+
     if chatbot:
         chatbot.total_chatbot_messages_count += 2
         await session.commit()
@@ -342,37 +351,20 @@ async def increment_chatbot_per_day_message_count(chatbot_id, session):
     return None
 
 
-async def increment_public_chatbot_per_day_message_count(chatbot, session):
+async def increment_chatbot_monthly_message_count(chatbot, session):
     today = datetime.utcnow().date().isoformat() # YYYY-MM-DD format
             
-    if chatbot.public_last_7_days_messages is None:
-        chatbot.public_last_7_days_messages = {}
+    if chatbot.monthly_messages_count is None:
+        chatbot.monthly_messages_count = 2
+    else:
+        chatbot.monthly_messages_count += 2
+    
+    print(f"Before update: {chatbot.monthly_messages_count}")
 
-    if isinstance(chatbot.public_last_7_days_messages, str):
-        import json
-        chatbot.public_last_7_days_messages = json.loads(chatbot.public_last_7_days_messages)
-
-    print(f"Before update: {chatbot.public_last_7_days_messages}")
-
-    # Increment today's count
-    chatbot.public_last_7_days_messages[today] = chatbot.public_last_7_days_messages.get(today, 0) + 2
-
-    # Keep only the last 7 days
-    seven_days_ago = (date.today() - timedelta(days=6)).isoformat()
-    chatbot.public_last_7_days_messages = {k: v for k, v in chatbot.public_last_7_days_messages.items() if k >= seven_days_ago}
-
-    # Mark JSON as modified
-    flag_modified(chatbot, "public_last_7_days_messages")
-
-    print(f"Before commit: {chatbot.public_last_7_days_messages}")
-
-    # 🔥 Commit and refresh
     session.add(chatbot) 
     await session.commit()
 
-    print(f"After commit: {chatbot.public_last_7_days_messages}")
-
-    return chatbot.public_last_7_days_messages
+    return chatbot.monthly_messages_count
 
 
 async def get_last_seven_days_count(chatbot_id, session):
@@ -389,12 +381,13 @@ async def get_last_seven_days_count(chatbot_id, session):
 
 
 
+
 async def reset_chatbot_message_counts():
     """
     Resets the admin message count and total chatbot messages count for all chatbots daily.
     """
     print(f"scheduler triggtered")
-    async for session in get_async_db():    # Use async session for DB operations
+    async for session in get_async_db():    # increment_external_bot_monthly_message_countUse async session for DB operations
         try:
             result = await session.execute(select(ChatbotConfig))
             chatbots = result.scalars().all()
@@ -408,12 +401,29 @@ async def reset_chatbot_message_counts():
         except Exception as e:
             print(f"Error resetting chatbot messages: {e}")
         finally:
-            await session.close()  
+            await session.close()
+
 # Schedule the reset function to run daily at 00:00 UTC
 # scheduler.add_job(reset_chatbot_message_counts, "cron", hour=0, minute=0)
+from datetime import datetime, timezone, timedelta
+from dateutil.relativedelta import relativedelta
 
-#monthly scheduler
-scheduler.add_job(reset_chatbot_message_counts, "cron", day=1, hour=0, minute=0)
-async def start_scheduler():
-    scheduler.start()
-    print("APScheduler started...")
+async def check_and_refresh_chat_cycle(user: User,bot_config, session) -> bool:
+
+    # Current UTC time
+    now = datetime.now(timezone.utc)
+    print(f'now and next: {now} >= {user.billing_cycle_end}')
+    if now >=  user.billing_cycle_end:
+        # Cycle expired → reset usage
+        bot_config.monthly_messages_count = 0
+        # Move cycle forward by 1 month
+        user.billing_cycle_end = now + relativedelta(months=1)
+
+        session.add_all([user, bot_config])
+        await session.commit()
+        await session.refresh(user)
+        print(f'returned treu in side check and refresh')
+        return True
+    else:
+        print(f'returned False in side check and refresh')
+        return False

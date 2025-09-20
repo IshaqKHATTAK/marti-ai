@@ -10,7 +10,7 @@ from app.common.env_config import get_envs_setting
 from app.services.auth import get_current_user
 from app.models.user import User
 from app.common.database_config import get_async_db
-from app.services.payment import adjust_tier_degration_change, update_payment_details, handle_invoice_update
+from app.services.payment import adjust_tier_degration_change, add_billing_start_period, update_payment_details, handle_invoice_update
 
 logger = logging.getLogger(__name__)
 
@@ -114,10 +114,21 @@ async def webhook_received(
 
     if event_type in ['customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted']:
         # await handle_subscription_update(data_object, session)
-
-        if data_object.get("customer"):
-            subscription_id = data_object["id"]
-            customer_id = data_object["customer"]
+            
+            if data_object.get("customer"):
+                subscription_id = data_object["id"]
+                customer_id = data_object["customer"]
+                if event_type in ['customer.subscription.created']:
+                    # Get billing cycle information
+                    current_period_start = data_object["current_period_start"]
+                    current_period_end = data_object["current_period_end"]
+                    # Convert to datetime if needed
+                    from datetime import datetime
+                    period_start_date = datetime.fromtimestamp(current_period_start)
+                    period_end_date = datetime.fromtimestamp(current_period_end)
+                    
+                    print(f'dates in webhook:  start:{period_start_date} --- End:{period_end_date}')
+                    await add_billing_start_period(session, customer_id, period_start_date)
 
             if event_type in ['customer.subscription.created', 'customer.subscription.updated']:
                 if data_object["status"] == "active":
@@ -132,6 +143,15 @@ async def webhook_received(
                     await adjust_tier_degration_change(session, user_data)
 
     elif event_type in ['invoice.payment_succeeded', 'invoice.payment_failed']:
+        # Get billing cycle information
+        current_period_start = data_object["current_period_start"]
+        current_period_end = data_object["current_period_end"]
+        # Convert to datetime if needed
+        from datetime import datetime
+        period_start_date = datetime.fromtimestamp(current_period_start)
+        period_end_date = datetime.fromtimestamp(current_period_end)
+        
+        print(f'dates in webhook:  start:{period_start_date} --- End:{period_end_date}')
         await handle_invoice_update(data_object, session)
 
     return JSONResponse({'status': 'success'})
