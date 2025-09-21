@@ -463,7 +463,6 @@ async def get_ai_response(
         llm, 
         chatbot_id: int, 
         org_id: int, 
-        db_session, 
         enable_image_generation=False, 
         chatbot_type = None, 
         chat_history = None, 

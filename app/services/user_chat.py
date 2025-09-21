@@ -51,12 +51,21 @@ def configure_persistence(redis_client):
     print("Redis persistence configured with RDB and AOF")
 
 redis_store = Redis(
-    host=envs.REDIS_HOST, 
-    port=envs.REDIS_PORT, 
+    host='redis-11625.crce204.eu-west-2-3.ec2.redns.redis-cloud.com',
+    port=11625,
     decode_responses=True,
     username="default",
-    password="4ZLcWah0ofyql0KvynHmb30l94AwyBx2",
-    ) #for local
+    password="nhW0KwSY4jLJnnOTE129Du47M2bJ0pfO",
+)
+
+# redis_store = Redis(
+#     host=envs.REDIS_HOST, 
+#     port=envs.REDIS_PORT, 
+#     decode_responses=True,
+#     username="default",
+#     password="4ZLcWah0ofyql0KvynHmb30l94AwyBx2",
+#   
+#     ) #for local
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +81,7 @@ logger = logging.getLogger(__name__)
 #     ) # AWS redis does not have auth applied.
 
 
-# configure_persistence(redis_store)
+configure_persistence(redis_store)
 # Initialize S3 client
 s3_client = boto3.client("s3")
 from cryptography.fernet import Fernet
@@ -590,7 +599,7 @@ async def _get_guardrails(bot_id, session):
     guardrails = result.scalars().all()  # Fetch all guardrail texts as a list
     return ", ".join(guardrails) if guardrails else ""
 
-async def chat_with_external_bot(data: UserSecureChat, session, background_tasks: BackgroundTasks):
+async def chat_with_external_bot(data: UserSecureChat, background_tasks: BackgroundTasks):
     try:
         fingerprint = data.fingerprint
         thread_id = data.id
@@ -728,7 +737,7 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
         image_description = None
         url_to_image = None
         image_generation = False
-        response = await get_ai_response(db_session=session, memory_status=False, LLM_ROLE="friendly", llm = llm, chatbot_id = int(data.bot_id),  org_id =organization_id, chat_history = chat_history, scaffolding_level ="") #  21 10 current_user.id  current_user.organization_id
+        response = await get_ai_response( memory_status=False, LLM_ROLE="friendly", llm = llm, chatbot_id = int(data.bot_id),  org_id =organization_id, chat_history = chat_history, scaffolding_level ="") #  21 10 current_user.id  current_user.organization_id
         response_content = response["answer"]
         response = {"role": "assistant", "message": f"{response_content}"}
 
