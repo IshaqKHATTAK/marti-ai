@@ -659,52 +659,23 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
         else:
             print(f"ES: The user token key will expire in {token_ttl} seconds.")
         
-        if request_count >= envs.USER_REQUESTS_PER_X_SECONDS:
-            raise HTTPException(status_code=429, detail=f"Thread message limit exceeded. Please try again after {request_ttl} seconds")
+        # if request_count >= envs.USER_REQUESTS_PER_X_SECONDS:
+        #     raise HTTPException(status_code=429, detail=f"Thread message limit exceeded. Please try again after {request_ttl} seconds")
         
-        if token_count > envs.USER_TOKENS_PER_X_SECONDS:
-            raise HTTPException(status_code=429, detail=f"Thread token limit exceeded. Please try again after {token_ttl} seconds")
+        # if token_count > envs.USER_TOKENS_PER_X_SECONDS:
+        #     raise HTTPException(status_code=429, detail=f"Thread token limit exceeded. Please try again after {token_ttl} seconds")
         
         question = await format_user_question(user_input=data.question, images_urls=data.images_urls)
-        encrypted_bot_id = data.bot_id
-        data.bot_id = _decrypt_chatbot_id(data.bot_id, fernet = fernet)
+        # encrypted_bot_id = data.bot_id
+        # data.bot_id = _decrypt_chatbot_id(data.bot_id, fernet = fernet)
+        data.bot_id=40
         print(f'bot id being extracted = {data.bot_id}')
-        bot_config = await get_chatbot_config_by_id(int(data.bot_id), session)
-        org_admin = await _get_admin(organization_id=bot_config.organization_id, session=session)
-
-        print(f'::bot_config.monthly_messages_count:: {bot_config.monthly_messages_count}')
-        if org_admin.current_plan == Plan.free and org_admin.is_paid:
-            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
-                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
-                if not is_expired:
-                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
-            if bot_config.per_day_messages >= envs.PUBLIC_MESSAGES_WITH_EXTERNAL_PER_DAY_FREMIUM:
-                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
-                if not is_expired:
-                    raise HTTPException(status_code=404, detail="You have reached your daily message limit. Please upgrade your plan.")
-        elif org_admin.current_plan == Plan.starter:
-            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.STARTER_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
-                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
-                if not is_expired:
-                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
-        elif org_admin.current_plan == Plan.enterprise:
-            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.ENTERPRISE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
-                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
-                if not is_expired:
-                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit.")
-        elif org_admin.current_plan == Plan.free:
-            if bot_config.monthly_messages_count and bot_config.monthly_messages_count >= envs.FREE_PLAN_EXTERNAL_BOT_MONTHLY_MESSAGES:
-                is_expired = await check_and_refresh_chat_cycle(org_admin, bot_config, session=session)
-                if not is_expired:
-                    raise HTTPException(status_code=404, detail="You have reached your monthly message limit. Please upgrade your plan.")
+        # bot_config = await get_chatbot_config_by_id(int(data.bot_id), session)
+        # org_admin = await _get_admin(organization_id=bot_config.organization_id, session=session)
             
-            
-        if not bot_config:
-            raise HTTPException(status_code=404, detail="Chatbot not found")
-
-        llm_name  = await get_organization_chabot_name( db = session)
+        
         # llm = load_llm(api_key=envs.OPENAI_API_KEY, name='gpt-4o', temperature=bot_config.llm_temperature)
-        llm = load_llm(api_key=envs.OPENAI_API_KEY, name=llm_name if llm_name else "gpt-4.1", temperature=bot_config.llm_temperature)
+        llm = load_llm(api_key=envs.OPENAI_API_KEY, name="gpt-4.1", temperature=0.1)
 
         # llm = load_llm(api_key=envs.OPENAI_API_KEY, name=bot_config.llm_model_name, temperature=bot_config.llm_temperature)
         
@@ -750,19 +721,14 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
 
         chat_history.append(HumanMessage(content=question["content"]))
         print(f'chat hisotry created')
-        chatbot_query = select(ChatbotConfig).filter(ChatbotConfig.id == int(data.bot_id))
-        chatbot_result = await session.execute(chatbot_query)
-        chatbot = chatbot_result.scalar_one_or_none()
-        print(f'chatbot queryied')
-        if not chatbot:
-            raise HTTPException(status_code=404, detail="Chatbot not found") 
-        organization_id = chatbot.organization_id
+        
+        organization_id = 20
 
         response = None
         image_description = None
         url_to_image = None
         image_generation = False
-        response = await get_ai_response(db_session=session, memory_status=chatbot.memory_status, LLM_ROLE=bot_config.llm_role, llm = llm, chatbot_id = int(data.bot_id),  org_id =organization_id, chat_history = chat_history, scaffolding_level =bot_config.scaffolding_level) #  21 10 current_user.id  current_user.organization_id
+        response = await get_ai_response(db_session=session, memory_status=False, LLM_ROLE="friendly", llm = llm, chatbot_id = int(data.bot_id),  org_id =organization_id, chat_history = chat_history, scaffolding_level ="") #  21 10 current_user.id  current_user.organization_id
         response_content = response["answer"]
         response = {"role": "assistant", "message": f"{response_content}"}
 
@@ -781,7 +747,6 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
             await redis_store.incrby(user_req_key, 1)
 
     
-
         app_tokens_key = "app:tokens"
         if not await redis_store.exists(app_tokens_key):
             await redis_store.set(app_tokens_key, llm_tokens, ex=envs.APP_KEY_DURATION_SECONDS)
@@ -805,23 +770,6 @@ async def chat_with_external_bot(data: UserSecureChat, session, background_tasks
 
             await redis_store.delete(lru_session_id)
         
-        background_tasks.add_task(
-            increment_chatbot_monthly_message_count,
-            chatbot = bot_config,
-            session = session
-        )
-
-        background_tasks.add_task(
-            increment_chatbot_message_count,
-            chatbot_id = bot_config.id,
-            session = session
-        )
-        
-        # background_tasks.add_task(
-        #     increment_chatbot_per_day_message_count,
-        #     chatbot_id = bot_config.id,
-        #     session = session
-        #     )
         return response, thread_id, #image_generation
     
     except Exception as e:

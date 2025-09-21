@@ -72,14 +72,14 @@ async def get_share_iframe(
         raise HTTPException(status_code=500, detail=str(e))
     
 @chats_routes.post("/external/send-message", status_code=status.HTTP_200_OK, response_model=ExternalChatbotResponse)
-async def send_message(data: UserSecureChat, backgound_task:BackgroundTasks, session: Session = Depends(database_config.get_async_db)): 
+async def send_message(data: UserSecureChat, backgound_task:BackgroundTasks): 
     #application wide limit here
 
     await app_limiter.init_redis()
     await app_limiter.check_chat_limits()
 
 
-    bot_answer, thread_id =  await user_chat.chat_with_external_bot(data, session, background_tasks=backgound_task)
+    bot_answer, thread_id =  await user_chat.chat_with_external_bot(data, background_tasks=backgound_task)
     
     return ExternalChatbotResponse(
         id=thread_id, 
