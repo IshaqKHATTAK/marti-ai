@@ -65,10 +65,11 @@ class ContextRetrieverTool(BaseTool):
             formatted_docs = []
             for doc in documents:
                 text = doc.get("metadata", {}).get("text", "")
+                file_name = doc.get("metadata",{}).get("file_name","")
                 if text:
                     formatted_docs.append({
                         "id": doc.get("id", ""),
-                        "text": text[:1800]  # Truncate for reranker token limit
+                        "text": text[:1800] + file_name  # Truncate for reranker token limit
                     })
             
             if not formatted_docs:
