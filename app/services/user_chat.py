@@ -674,11 +674,6 @@ async def stream_with_external_bot(data: UserSecureChat):
         else:
             print(f"ES: The user token key will expire in {token_ttl} seconds.")
         
-        if request_count >= envs.USER_REQUESTS_PER_X_SECONDS:
-            raise HTTPException(status_code=429, detail=f"Thread message limit exceeded. Please try again after {request_ttl} seconds")
-        
-        if token_count > envs.USER_TOKENS_PER_X_SECONDS:
-            raise HTTPException(status_code=429, detail=f"Thread token limit exceeded. Please try again after {token_ttl} seconds")
         
         question = await format_user_question(user_input=data.question, images_urls=data.images_urls)
 
