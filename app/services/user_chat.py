@@ -609,27 +609,21 @@ async def stream_with_external_bot(data: UserSecureChat):
             print(f"Existing thread id is : {existing_thread}")
            
             if existing_thread:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "detail": "This fingerprint already has a thread",
-                        "thread_id": existing_thread
-                    }
+                thread_id = existing_thread
+            else:
+                new_thread_id = str(uuid.uuid4())
+                print(f"New thread id is : {new_thread_id}")
+              
+                await redis_store.set(
+                    f"fingerprint:{fingerprint}", 
+                    new_thread_id, 
+                    ex=envs.FINGERPRINT_DURATION_SECONDS
                 )
-            
-            new_thread_id = str(uuid.uuid4())
-            print(f"New thread id is : {new_thread_id}")
-          
-            await redis_store.set(
-                f"fingerprint:{fingerprint}", 
-                new_thread_id, 
-                ex=envs.FINGERPRINT_DURATION_SECONDS
-            )
 
-            await redis_store.set(f"thread:{new_thread_id}:tokens", 0, ex=envs.USER_KEY_DURATION_SECONDS)
-            await redis_store.set(f"thread:{new_thread_id}:requests", 0, ex=envs.USER_KEY_DURATION_SECONDS)
-            
-            thread_id = new_thread_id
+                await redis_store.set(f"thread:{new_thread_id}:tokens", 0, ex=envs.USER_KEY_DURATION_SECONDS)
+                await redis_store.set(f"thread:{new_thread_id}:requests", 0, ex=envs.USER_KEY_DURATION_SECONDS)
+                
+                thread_id = new_thread_id
         
         yield {
         "type": "connected",
