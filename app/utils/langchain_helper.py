@@ -5,6 +5,7 @@ from langchain_core.output_parsers import StrOutputParser
 from sqlalchemy.exc import SQLAlchemyError
 import backoff
 import logging
+from app.utils.simple_agent import stream_general_graph as stream_simple_agent_graph
 from app.models.chatbot_model import ScaffoldingLevel
 import math
 from app.schemas.response.user_chat import Chats, GetMessagesResponse, GetMessagesResponseInternal
@@ -406,8 +407,7 @@ async def get_stream_ai_response(LLM_ROLE,
         memory_status, 
         llm, 
         chatbot_id: int, 
-        org_id: int, 
-        db_session, 
+        org_id: int,  
         enable_image_generation=False, 
         chatbot_type = None, 
         chat_history = None, 

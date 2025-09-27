@@ -221,11 +221,11 @@ async def create_organization_user_service(
 
     if current_user.role in [UserRole.SUPER_ADMIN, UserRole.USER]:
         current_user = await get_user_organization_admin(db = db, organization_id = organization_id)
-    if current_user.current_plan != Plan.enterprise:
-        raise HTTPException(
-            status_code=400,
-            detail="To create organization users you must have enterprise subscription."
-        )
+    # if current_user.current_plan != Plan.enterprise:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail="To create organization users you must have enterprise subscription."
+    #     )
     #-------------------------------------------THIS NEEDS TO BE COMMENT REMOVED.------------------------------------------------------------------------
     # from app.services.payment import allowed_users_checks
     # users_falg = await allowed_users_checks(db, current_user.stripeId)
@@ -254,10 +254,11 @@ async def create_organization_user_service(
     user_data.group_ids = user_group_ids
     if current_user.current_plan == Plan.free: # Free trial only --and current_user.is_paid
         print(f'inside free')
-        raise HTTPException(
-                status_code=400,
-                detail="Please upgrade your plan to create a users."
-            )
+        # raise HTTPException(
+        #         status_code=400,
+        #         detail="Please upgrade your plan to create a users."
+        #     )
+        
         # if not current_user.is_paid:
         #     raise HTTPException(
         #         status_code=400,

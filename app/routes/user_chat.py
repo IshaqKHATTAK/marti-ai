@@ -78,13 +78,48 @@ async def send_message(data: UserSecureChat, backgound_task:BackgroundTasks):
     await app_limiter.init_redis()
     await app_limiter.check_chat_limits()
 
+    print(f'start execuction')
 
-    bot_answer, thread_id =  await user_chat.chat_with_external_bot(data, background_tasks=backgound_task)
-    
-    return ExternalChatbotResponse(
-        id=thread_id, 
-        answer=bot_answer['message']
+        #Streaming calls here
+    async def generate_sse_response():
+        """Generate SSE formatted response with proper error handling"""
+        try:
+            # Stream pre-formatted events from service
+            async for chunk in user_chat.stream_with_external_bot(
+                data
+            ):
+                yield f"data: {json.dumps(chunk)}\n\n"
+            # Completion signal
+            yield f"data: {json.dumps({'type': 'done', 'message': 'Stream completed'})}\n\n"
+        except HTTPException as e:
+            yield f"data: {json.dumps({'error': e.detail, 'type': 'error', 'status_code': e.status_code})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': f'Unexpected error: {str(e)}', 'type': 'error'})}\n\n"
+        finally:
+            yield f"data: {json.dumps({'type': 'close'})}\n\n"
+
+    # bot_answer, thread_id =  await user_chat.chat_with_external_bot(data, background_tasks=backgound_task)
+    return StreamingResponse(
+        generate_sse_response(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "Content-Encoding": "identity",
+            "Transfer-Encoding": "chunked",
+            "X-Accel-Buffering": "no",
+            "X-Proxy-Buffering": "off",
+            "X-Content-Type-Options": "nosniff",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
     )
+
+    
+    # return ExternalChatbotResponse(
+    #     id=thread_id, 
+    #     answer=bot_answer['message']
+    # )
 
 
 @chats_routes.post("/external/s3-public-session-url", status_code=status.HTTP_200_OK, response_model=PublicS3Response)

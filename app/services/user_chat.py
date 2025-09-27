@@ -599,6 +599,208 @@ async def _get_guardrails(bot_id, session):
     guardrails = result.scalars().all()  # Fetch all guardrail texts as a list
     return ", ".join(guardrails) if guardrails else ""
 
+async def stream_with_external_bot(data: UserSecureChat):
+    try:
+        fingerprint = data.fingerprint
+        thread_id = data.id
+
+        if not thread_id:
+            existing_thread = await redis_store.get(f"fingerprint:{fingerprint}")
+            print(f"Existing thread id is : {existing_thread}")
+           
+            if existing_thread:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "detail": "This fingerprint already has a thread",
+                        "thread_id": existing_thread
+                    }
+                )
+            
+            new_thread_id = str(uuid.uuid4())
+            print(f"New thread id is : {new_thread_id}")
+          
+            await redis_store.set(
+                f"fingerprint:{fingerprint}", 
+                new_thread_id, 
+                ex=envs.FINGERPRINT_DURATION_SECONDS
+            )
+
+            await redis_store.set(f"thread:{new_thread_id}:tokens", 0, ex=envs.USER_KEY_DURATION_SECONDS)
+            await redis_store.set(f"thread:{new_thread_id}:requests", 0, ex=envs.USER_KEY_DURATION_SECONDS)
+            
+            thread_id = new_thread_id
+        
+        yield {
+        "type": "connected",
+        "message": "Connected to chat stream",
+        "thread_id": thread_id
+        }
+        # Validate fingerprint-thread_id relationship
+        stored_thread_id = await redis_store.get(f"fingerprint:{fingerprint}")
+        if not stored_thread_id or stored_thread_id != thread_id:
+            raise HTTPException(400, "Fingerprint does not match thread_id")
+        
+        user_token_key = f"public:{fingerprint}:{thread_id}:tokens"
+        user_req_key = f"public:{fingerprint}:{thread_id}:requests"
+
+
+        token_count = int(await redis_store.get(user_token_key) or 0)
+        request_count = int(await redis_store.get(user_req_key) or 0)
+        print(f"\nUser request count is {request_count} and user token count is {token_count}\n\n")
+       
+
+        request_ttl = await redis_store.ttl(user_req_key)
+
+        if request_ttl == -1:
+            request_ttl = 5
+            print("ES: App request key has no associated expiration.")
+        elif request_ttl == -2:
+            request_ttl = 5
+            print("ES: App request key does not exist.")
+        else:
+            # seconds_till_next_minute = 60 - (time.time() % 60)
+            print(f"ES: App request key will expire in {request_ttl} seconds.")
+        
+        # Get the remaining time to live (TTL) for a key
+        token_ttl = await redis_store.ttl(user_token_key)
+
+        if token_ttl == -1:
+            token_ttl = 5
+            print("ES: The user token key has no associated expiration.")
+        elif token_ttl == -2:
+            token_ttl = 5
+            print("ES: The user token key does not exist.")
+        else:
+            print(f"ES: The user token key will expire in {token_ttl} seconds.")
+        
+        if request_count >= envs.USER_REQUESTS_PER_X_SECONDS:
+            raise HTTPException(status_code=429, detail=f"Thread message limit exceeded. Please try again after {request_ttl} seconds")
+        
+        if token_count > envs.USER_TOKENS_PER_X_SECONDS:
+            raise HTTPException(status_code=429, detail=f"Thread token limit exceeded. Please try again after {token_ttl} seconds")
+        
+        question = await format_user_question(user_input=data.question, images_urls=data.images_urls)
+
+        data.bot_id = 40
+        print(f'bot id being extracted = {data.bot_id}')
+        
+
+        # llm = load_llm(api_key=envs.OPENAI_API_KEY, name='gpt-4o', temperature=bot_config.llm_temperature)
+        llm = load_llm(api_key=envs.OPENAI_API_KEY, name="gpt-4.1", temperature=0.2)
+
+        # llm = load_llm(api_key=envs.OPENAI_API_KEY, name=bot_config.llm_model_name, temperature=bot_config.llm_temperature)
+        
+        data.id = thread_id
+        chat_messages = await get_external_bot_chat_messagegs(fingerprint, thread_id, redis_store)
+
+        # print(f"\nChat messages are: {chat_messages}\n\n")
+        chat_history = []
+
+        if chat_messages is not None:
+            for msg in chat_messages:
+                # msg = json.loads(msg)
+                print(f'message while creating history {msg}')
+                if msg["role"] == "ai":
+                    message_content = msg.get("message", [{}])[0]
+                    additional_kwargs = message_content.get("additional_kwargs", {})
+
+                    if additional_kwargs:
+                        chat_history.append(
+                                AIMessage(
+                                    content=message_content.get("text", ""),
+                                    additional_kwargs=additional_kwargs,
+                                    response_metadata=msg.get("response_metadata", {}),
+                                    tool_calls=msg.get("tool_calls", [])
+                                )
+                            )
+                    else:
+                        print(f'else AI history')
+                        chat_history.append(AIMessage(content=msg["message"][0]["text"]))
+
+                elif  msg["role"] == "human":
+                    # chat_history.append(HumanMessage(content=msg["message"][0]["text"]))
+                    message_content = msg["message"][0]
+                    if "image_url" in message_content:  # Handle image URLs
+                        chat_history.append(HumanMessage(content=[{"type": "image_url", "image_url": message_content["image_url"]}]))
+
+                        # chat_history.append(HumanMessage(content=[{"type": "image_url", "image_url": message_content["image_url"]["url"]}]))
+                    else:  # Handle text
+                        chat_history.append(HumanMessage(content=message_content.get("text", "")))
+                    
+                elif msg["role"] == "tool":
+                    chat_history.append(ToolMessage(content=msg["message"][0]["text"], tool_call_id=msg["id"]))
+
+        chat_history.append(HumanMessage(content=question["content"]))
+        print(f'chat hisotry created')
+
+        organization_id = 20
+
+        response = None
+        image_description = None
+        url_to_image = None
+        image_generation = False
+        response_content = ''
+        async for chunk in get_stream_ai_response(
+                memory_status=False,
+                LLM_ROLE="friendly",
+                llm=llm,
+                chatbot_id=data.bot_id,
+                org_id=organization_id,
+                chat_history=chat_history,
+                thread_id=thread_id,
+                scaffolding_level=''
+            ):
+                yield chunk
+                # Collect only actual AI content for database (exclude status messages)
+                if chunk.get("type") == "content":
+                    response_content += chunk.get("content")
+
+        response = {"role": "assistant", "message": f"{response_content}"}
+
+        llm_tokens = 100
+       
+        if not await redis_store.exists(user_token_key):
+            await redis_store.set(user_token_key, llm_tokens, ex=envs.USER_KEY_DURATION_SECONDS)
+        else:
+            await redis_store.incrby(user_token_key, llm_tokens)
+
+
+        if not await redis_store.exists(user_req_key):
+            await redis_store.incr(user_req_key)
+            await redis_store.expire(user_req_key, envs.USER_KEY_DURATION_SECONDS)
+        else:
+            await redis_store.incrby(user_req_key, 1)
+
+        app_tokens_key = "app:tokens"
+        if not await redis_store.exists(app_tokens_key):
+            await redis_store.set(app_tokens_key, llm_tokens, ex=envs.APP_KEY_DURATION_SECONDS)
+        else:
+            await redis_store.incrby(app_tokens_key, llm_tokens)
+
+        await redis_store.rpush(f"public:conversation:{fingerprint}:{thread_id}", json.dumps({"role": "human", "message": [{'type': 'text', 'text': data.question}]}))
+        await redis_store.rpush(f"public:conversation:{fingerprint}:{thread_id}", json.dumps({"role": "ai", "message": [{"type": "text", "text": response['message']}]}))
+        if data.images_urls:
+            for url in data.images_urls:
+                await redis_store.rpush(f"public:conversation:{fingerprint}:{thread_id}", json.dumps({"role": "human", "message": [{"type": "image_url", "image_url": {"url": url}}]}))
+
+        await redis_store.expire(f"public:conversation:{fingerprint}:{thread_id}", envs.PUBLIC_TIME_TO_LIVE_IN_SECONDS)
+        
+        current_time = time.time()
+        await redis_store.zadd("active_sessions", {str(data.id): current_time})
+        if await redis_store.zcard("active_sessions") > envs.MAX_SESSIONS:
+            lru_session_id = (await redis_store.zrange("active_sessions", 0, 0))[0]
+
+            await redis_store.zrem("active_sessions", lru_session_id)
+
+            await redis_store.delete(lru_session_id)
+    
+    
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+
 async def chat_with_external_bot(data: UserSecureChat, background_tasks: BackgroundTasks):
     try:
         fingerprint = data.fingerprint
@@ -642,7 +844,6 @@ async def chat_with_external_bot(data: UserSecureChat, background_tasks: Backgro
         token_count = int(await redis_store.get(user_token_key) or 0)
         request_count = int(await redis_store.get(user_req_key) or 0)
         print(f"\nUser request count is {request_count} and user token count is {token_count}\n\n")
-       
 
         request_ttl = await redis_store.ttl(user_req_key)
 
@@ -667,31 +868,13 @@ async def chat_with_external_bot(data: UserSecureChat, background_tasks: Backgro
             print("ES: The user token key does not exist.")
         else:
             print(f"ES: The user token key will expire in {token_ttl} seconds.")
-        
-        # if request_count >= envs.USER_REQUESTS_PER_X_SECONDS:
-        #     raise HTTPException(status_code=429, detail=f"Thread message limit exceeded. Please try again after {request_ttl} seconds")
-        
-        # if token_count > envs.USER_TOKENS_PER_X_SECONDS:
-        #     raise HTTPException(status_code=429, detail=f"Thread token limit exceeded. Please try again after {token_ttl} seconds")
-        
         question = await format_user_question(user_input=data.question, images_urls=data.images_urls)
-        # encrypted_bot_id = data.bot_id
-        # data.bot_id = _decrypt_chatbot_id(data.bot_id, fernet = fernet)
         data.bot_id=40
         print(f'bot id being extracted = {data.bot_id}')
-        # bot_config = await get_chatbot_config_by_id(int(data.bot_id), session)
-        # org_admin = await _get_admin(organization_id=bot_config.organization_id, session=session)
-            
-        
-        # llm = load_llm(api_key=envs.OPENAI_API_KEY, name='gpt-4o', temperature=bot_config.llm_temperature)
         llm = load_llm(api_key=envs.OPENAI_API_KEY, name="gpt-4.1", temperature=0.1)
 
-        # llm = load_llm(api_key=envs.OPENAI_API_KEY, name=bot_config.llm_model_name, temperature=bot_config.llm_temperature)
-        
         data.id = thread_id
         chat_messages = await get_external_bot_chat_messagegs(fingerprint, thread_id, redis_store)
-
-        # print(f"\nChat messages are: {chat_messages}\n\n")
         chat_history = []
 
         if chat_messages is not None:
@@ -748,14 +931,12 @@ async def chat_with_external_bot(data: UserSecureChat, background_tasks: Backgro
         else:
             await redis_store.incrby(user_token_key, llm_tokens)
 
-
         if not await redis_store.exists(user_req_key):
             await redis_store.incr(user_req_key)
             await redis_store.expire(user_req_key, envs.USER_KEY_DURATION_SECONDS)
         else:
             await redis_store.incrby(user_req_key, 1)
 
-    
         app_tokens_key = "app:tokens"
         if not await redis_store.exists(app_tokens_key):
             await redis_store.set(app_tokens_key, llm_tokens, ex=envs.APP_KEY_DURATION_SECONDS)
