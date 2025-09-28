@@ -624,26 +624,25 @@ async def stream_with_external_bot(data: UserSecureChat):
                 await redis_store.set(f"thread:{new_thread_id}:requests", 0, ex=envs.USER_KEY_DURATION_SECONDS)
                 
                 thread_id = new_thread_id
-        
+        # Validate fingerprint-thread_id relationship
+        stored_thread_id = await redis_store.get(f"fingerprint:{fingerprint}")
+        if not stored_thread_id or stored_thread_id != thread_id:
+            thread_id = stored_thread_id
+            
         yield {
         "type": "connected",
         "message": "Connected to chat stream",
         "thread_id": thread_id
         }
-        # Validate fingerprint-thread_id relationship
-        stored_thread_id = await redis_store.get(f"fingerprint:{fingerprint}")
-        if not stored_thread_id or stored_thread_id != thread_id:
-            raise HTTPException(400, "Fingerprint does not match thread_id")
+        
         
         user_token_key = f"public:{fingerprint}:{thread_id}:tokens"
         user_req_key = f"public:{fingerprint}:{thread_id}:requests"
-
 
         token_count = int(await redis_store.get(user_token_key) or 0)
         request_count = int(await redis_store.get(user_req_key) or 0)
         print(f"\nUser request count is {request_count} and user token count is {token_count}\n\n")
        
-
         request_ttl = await redis_store.ttl(user_req_key)
 
         if request_ttl == -1:
